@@ -1,7 +1,7 @@
-"""ASTR story catalog client used by the ver0.5 story-download module.
+"""ASTR story catalog client used by the story-download module.
 
 The site is a JavaScript viewer. Its hierarchy and story text are JSON files,
-so ver0.5 talks to those files directly and caches them locally.
+so the application talks to those files directly and caches them locally.
 """
 
 from __future__ import annotations

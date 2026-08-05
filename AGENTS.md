@@ -39,4 +39,4 @@ python -m py_compile main.py prts_catalog.py quality_analysis.py reader_engine.p
 python main.py --check
 ```
 
-源代码仓库不提供打包脚本和 portable 运行时。若需要制作 Windows EXE，应在独立构建目录中准备 Python、依赖和 PyInstaller，构建产物不要提交到本仓库。
+源代码仓库提供通用的 `build_windows.ps1` 打包脚本，但不提供 portable Python、模型或 GPU 运行时。构建前请按 `docs/WINDOWS_PACKAGING.md` 创建虚拟环境并安装构建依赖；EXE 和构建目录不要提交到本仓库。

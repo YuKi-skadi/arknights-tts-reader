@@ -1,6 +1,5 @@
-"""Arknights TTS Reader ver0.5 - modular desktop UI shell.
+"""Arknights TTS Reader - modular desktop UI shell.
 
-This first ver0.5 build intentionally contains only the application shell.
 Each feature owns a workspace panel, while the reader controls stay global in
 the lower-left corner so they remain available when switching modules.
 """
@@ -49,7 +48,17 @@ from quality_analysis import (
 )
 
 
-APP_TITLE = "明日方舟剧情阅读器 ver0.5"
+APP_TITLE = "明日方舟剧情阅读器"
+
+
+CUSTOMIZATION_SLOTS = {
+    "sidebar": ("侧边栏装饰图", (200, 220)),
+    "workspace_story_download": ("剧情下载标题图", (96, 72)),
+    "workspace_voice_generation": ("语音生成标题图", (96, 72)),
+    "workspace_voice_packs": ("资源管理标题图", (96, 72)),
+    "workspace_reader": ("朗读监听标题图", (96, 72)),
+}
+CUSTOMIZATION_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 
 def project_dir() -> Path:
@@ -103,6 +112,8 @@ class BasePanel(ttk.Frame):
     def __init__(self, master: tk.Misc, app: "ReaderApp") -> None:
         super().__init__(master, style="Workspace.TFrame")
         self.app = app
+        self.module_key = str(getattr(app, "_building_module_key", ""))
+        self.workspace_art_label: tk.Label | None = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
         self.build()
@@ -114,13 +125,38 @@ class BasePanel(ttk.Frame):
         header = ttk.Frame(self, style="Workspace.TFrame")
         header.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 14))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text=title, style="PageTitle.TLabel").grid(
+        title_row = ttk.Frame(header, style="Workspace.TFrame")
+        title_row.grid(row=0, column=0, sticky="ew")
+        title_row.columnconfigure(1, weight=1)
+        ttk.Label(title_row, text=title, style="PageTitle.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Label(header, text=description, style="Hint.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(6, 0)
+        self.workspace_art_label = tk.Label(
+            title_row,
+            bg="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            anchor="nw",
         )
+        self.workspace_art_label.grid(row=0, column=1, sticky="nw", padx=(18, 0))
+        ttk.Label(header, text=description, style="Hint.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        self.update_custom_images()
         return header
+
+    def update_custom_images(self) -> None:
+        if self.workspace_art_label is None:
+            return
+        photo = self.app.get_custom_photo(f"workspace_{self.module_key}")
+        if photo is None:
+            self.workspace_art_label.configure(image="")
+            self.workspace_art_label.image = None
+            self.workspace_art_label.grid_remove()
+            return
+        self.workspace_art_label.configure(image=photo)
+        self.workspace_art_label.image = photo
+        self.workspace_art_label.grid()
 
     def card(self, parent: tk.Misc, row: int, column: int = 0) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Card.TFrame", padding=18)
@@ -213,7 +249,7 @@ class StoryDownloadPanel(BasePanel):
 
 
 class ConnectedStoryDownloadPanel(BasePanel):
-    """Connected story selector used by the ver0.5 workspace."""
+    """Connected story selector used by the story-download workspace."""
 
     CATEGORY_FILTERS = {
         "主题曲": {"maintheme"},
@@ -641,7 +677,7 @@ class VoiceGenerationPanel(BasePanel):
         )
         self.engine.current(0)
         self.engine.grid(row=0, column=1, sticky="w")
-        ttk.Label(model_card, text="模型和缓存将放在 ver0.5 目录的 data 文件夹中。", style="Hint.TLabel").grid(
+        ttk.Label(model_card, text="模型和缓存将放在应用目录的 data 文件夹中。", style="Hint.TLabel").grid(
             row=1, column=1, sticky="w", pady=(9, 0)
         )
 
@@ -676,7 +712,6 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.qwen_mode = tk.StringVar(value=QWEN_MODE_CUSTOM)
         self.reference_audio = tk.StringVar()
         self.reference_text = tk.StringVar()
-        self.qwen_instruct = tk.StringVar()
         self.optimize_quality = tk.BooleanVar(value=False)
         self.queue_config = (ENGINE_EDGE, voice_options(ENGINE_EDGE)[0], 1.0)
         super().__init__(master, app)
@@ -731,17 +766,20 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.reference_text_entry = ttk.Entry(options, textvariable=self.reference_text, width=38)
         self.reference_text_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(14, 0))
 
-        self.instruct_label = ttk.Label(options, text="情绪提示", style="Section.TLabel")
-        self.instruct_label.grid(row=3, column=0, sticky="w", pady=(14, 0))
-        self.instruct_entry = ttk.Entry(options, textvariable=self.qwen_instruct, width=38)
-        self.instruct_entry.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(14, 0))
-
         self.optimize_quality_check = ttk.Checkbutton(
             options,
             text="使用 DeepSeek 优化每句情绪",
             variable=self.optimize_quality,
         )
         self.optimize_quality_check.grid(row=4, column=1, sticky="w", pady=(14, 0))
+        self.clone_hint_label = ttk.Label(
+            options,
+            text="不填写参考文本：跨语言更稳定，但音色还原度略低；填写与音频对应的原文：音色还原更精确，但可能受参考语言影响。",
+            style="Hint.TLabel",
+            wraplength=520,
+            justify="left",
+        )
+        self.clone_hint_label.grid(row=4, column=2, columnspan=2, sticky="w", padx=(28, 0), pady=(14, 0))
 
         ttk.Label(options, text="生成语速", style="Section.TLabel").grid(row=5, column=0, sticky="w", pady=(14, 0))
         self.generation_speed = tk.DoubleVar(value=1.0)
@@ -848,8 +886,11 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.reference_entry.configure(state=entry_state)
         self.reference_text_entry.configure(state=entry_state)
         self.reference_button.configure(state="normal" if clone_enabled else "disabled")
-        self.instruct_entry.configure(state="normal" if qwen_enabled else "disabled")
         self.optimize_quality_check.configure(state="normal" if qwen_enabled else "disabled")
+        if clone_enabled:
+            self.clone_hint_label.grid()
+        else:
+            self.clone_hint_label.grid_remove()
 
     def _update_voice_options(self) -> None:
         engine = self.engine_by_label.get(self.engine.get(), ENGINE_EDGE)
@@ -966,7 +1007,6 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             "mode": self.qwen_mode.get(),
             "reference_audio": self.reference_audio.get().strip(),
             "reference_text": self.reference_text.get().strip(),
-            "instruct": self.qwen_instruct.get().strip(),
         }
         if engine == ENGINE_QWEN and qwen_options["mode"] == QWEN_MODE_CLONE and not qwen_options["reference_audio"]:
             messagebox.showwarning("缺少参考音频", "声音克隆模式需要先选择参考音频。", parent=self)
@@ -1614,9 +1654,94 @@ class SettingsPanel(BasePanel):
             style="Hint.TLabel",
         ).grid(row=model_row + 1, column=1, sticky="w")
 
-        ttk.Button(card, text="保存设置", command=self.save_settings).grid(
-            row=model_row + 2, column=1, sticky="e", pady=(16, 0)
+        customization_row = model_row + 3
+        ttk.Separator(card, orient="horizontal").grid(
+            row=customization_row, column=0, columnspan=2, sticky="ew", pady=(14, 8)
         )
+        ttk.Label(card, text="界面个性化", style="Section.TLabel").grid(
+            row=customization_row + 1, column=0, sticky="w", pady=(0, 4)
+        )
+        self.customization_summary = ttk.Label(card, style="Hint.TLabel")
+        self.customization_summary.grid(row=customization_row + 1, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(
+            card,
+            text="统一管理侧边栏和四个工作区标题图片，上传后会自动适配标准区域。",
+            style="Hint.TLabel",
+        ).grid(row=customization_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Button(
+            card, text="打开个性化设置", command=self.open_customization_dialog
+        ).grid(row=customization_row + 3, column=1, sticky="e")
+        self.update_customization_summary()
+
+        ttk.Button(card, text="保存设置", command=self.save_settings).grid(
+            row=customization_row + 4, column=1, sticky="e", pady=(16, 0)
+        )
+
+    def update_customization_summary(self) -> None:
+        count = sum(1 for slot in CUSTOMIZATION_SLOTS if self.app.custom_image_path(slot))
+        self.customization_summary.configure(text=f"已设置 {count}/{len(CUSTOMIZATION_SLOTS)} 个区域")
+
+    def open_customization_dialog(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("界面个性化设置")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(False, False)
+        dialog.columnconfigure(1, weight=1)
+        ttk.Label(dialog, text="界面个性化", style="PageTitle.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=22, pady=(18, 4)
+        )
+        ttk.Label(
+            dialog,
+            text="图片会保持比例，自动缩放到对应区域；透明 PNG 的效果最佳。",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=22, pady=(0, 12))
+        names: dict[str, tk.StringVar] = {}
+        for row, (slot, (label, target)) in enumerate(CUSTOMIZATION_SLOTS.items(), start=2):
+            ttk.Label(dialog, text=f"{label}（{target[0]}×{target[1]}）").grid(
+                row=row, column=0, sticky="w", padx=(22, 12), pady=6
+            )
+            name_var = tk.StringVar(value=self.app.custom_image_name(slot))
+            names[slot] = name_var
+            ttk.Label(dialog, textvariable=name_var, style="Hint.TLabel").grid(
+                row=row, column=1, sticky="w", pady=6
+            )
+            area = ttk.Frame(dialog)
+            area.grid(row=row, column=2, sticky="e", padx=(12, 22), pady=6)
+            ttk.Button(
+                area,
+                text="选择图片",
+                command=lambda selected_slot=slot: self.choose_custom_image(selected_slot, dialog, names),
+            ).grid(row=0, column=0)
+            ttk.Button(
+                area,
+                text="清除",
+                command=lambda selected_slot=slot: self.clear_custom_image(selected_slot, dialog, names),
+            ).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(
+            dialog,
+            text="第一张提供的图片仍作为应用图标；未设置的区域保持默认界面。",
+            style="Hint.TLabel",
+        ).grid(row=2 + len(CUSTOMIZATION_SLOTS), column=0, columnspan=3, sticky="w", padx=22, pady=(12, 4))
+        ttk.Button(dialog, text="完成", command=dialog.destroy).grid(
+            row=3 + len(CUSTOMIZATION_SLOTS), column=2, sticky="e", padx=22, pady=(4, 18)
+        )
+        dialog.grab_set()
+
+    def choose_custom_image(self, slot: str, dialog: tk.Toplevel, names: dict[str, tk.StringVar]) -> None:
+        path = filedialog.askopenfilename(
+            parent=dialog,
+            title=f"选择{CUSTOMIZATION_SLOTS[slot][0]}",
+            filetypes=(("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("所有文件", "*.*")),
+        )
+        if path and self.app.set_custom_image(slot, Path(path)):
+            names[slot].set(self.app.custom_image_name(slot))
+            self.update_customization_summary()
+
+    def clear_custom_image(self, slot: str, dialog: tk.Toplevel, names: dict[str, tk.StringVar]) -> None:
+        if self.app.custom_image_path(slot):
+            self.app.clear_custom_image(slot)
+            names[slot].set(self.app.custom_image_name(slot))
+            self.update_customization_summary()
 
     def refresh_deepseek_models(self) -> None:
         api_key = self.deepseek_key_var.get().strip()
@@ -1718,11 +1843,14 @@ class ReaderApp(tk.Tk):
         configure_windows_dpi()
         super().__init__()
         self.title(APP_TITLE)
+        self._custom_photo_cache: dict[str, tuple[str, object]] = {}
+        self._set_window_icon()
         self.geometry("1180x760")
         self.minsize(960, 620)
         self.configure(bg="#eef1f5")
         self._configure_styles()
         self.settings = load_app_settings()
+        self._migrate_customization()
         try:
             self.ocr_interval = max(0.1, min(5.0, float(self.settings.get("ocr_interval", 0.25))))
         except (TypeError, ValueError):
@@ -1737,6 +1865,183 @@ class ReaderApp(tk.Tk):
         self._build_modules()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.show_module("story_download")
+
+    def _set_window_icon(self) -> None:
+        icon_path = project_dir() / "assets" / "app_icon.ico"
+        if not icon_path.is_file():
+            return
+        try:
+            self.iconbitmap(default=str(icon_path))
+        except (OSError, tk.TclError):
+            pass
+
+    def _customization_dir(self) -> Path:
+        return project_dir() / "data" / "customization"
+
+    def _customization_target(self, slot: str) -> tuple[int, int]:
+        return CUSTOMIZATION_SLOTS[slot][1]
+
+    def _resolve_configured_custom_path(self, key: str) -> Path | None:
+        configured = str(self.settings.get(key, "")).strip()
+        if not configured:
+            return None
+        path = Path(configured)
+        if not path.is_absolute():
+            path = project_dir() / path
+        try:
+            path = path.resolve()
+            path.relative_to(self._customization_dir().resolve())
+        except (OSError, ValueError):
+            return None
+        return path if path.is_file() else None
+
+    def _normalize_custom_image(self, slot: str, source: Path) -> Path:
+        from PIL import Image, ImageOps
+
+        target_width, target_height = self._customization_target(slot)
+        with Image.open(source) as original:
+            original.seek(0)
+            image = original.convert("RGBA")
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        fitted = ImageOps.contain(image, (target_width, target_height), method=resampling)
+        canvas = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
+        offset = ((target_width - fitted.width) // 2, (target_height - fitted.height) // 2)
+        canvas.alpha_composite(fitted, offset)
+        destination_dir = self._customization_dir()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / f"{slot}.png"
+        temporary = destination_dir / f".{slot}.tmp.png"
+        canvas.save(temporary, format="PNG", optimize=True)
+        temporary.replace(destination)
+        for old_path in destination_dir.glob(f"{slot}.*"):
+            if old_path != destination and old_path.is_file():
+                old_path.unlink()
+        return destination
+
+    def _migrate_customization(self) -> None:
+        changed = False
+        legacy_workspace = self._resolve_configured_custom_path("custom_workspace_image")
+        if legacy_workspace is not None:
+            for slot in CUSTOMIZATION_SLOTS:
+                if slot == "sidebar":
+                    continue
+                key = f"custom_{slot}_image"
+                if not self._resolve_configured_custom_path(key):
+                    try:
+                        destination = self._normalize_custom_image(slot, legacy_workspace)
+                    except Exception:
+                        continue
+                    self.settings[key] = str(destination.relative_to(project_dir())).replace("\\", "/")
+                    changed = True
+            self.settings.pop("custom_workspace_image", None)
+            changed = True
+        for slot in CUSTOMIZATION_SLOTS:
+            key = f"custom_{slot}_image"
+            source = self._resolve_configured_custom_path(key)
+            if source is None:
+                continue
+            target = self._customization_target(slot)
+            try:
+                needs_normalize = source.suffix.lower() != ".png"
+                if not needs_normalize:
+                    from PIL import Image
+
+                    with Image.open(source) as image:
+                        needs_normalize = image.size != target or image.mode != "RGBA"
+                if needs_normalize:
+                    destination = self._normalize_custom_image(slot, source)
+                    self.settings[key] = str(destination.relative_to(project_dir())).replace("\\", "/")
+                    changed = True
+            except Exception:
+                continue
+        if changed:
+            save_app_settings(self.settings)
+
+    def custom_image_path(self, slot: str) -> Path | None:
+        if slot not in CUSTOMIZATION_SLOTS:
+            return None
+        return self._resolve_configured_custom_path(f"custom_{slot}_image")
+
+    def custom_image_name(self, slot: str) -> str:
+        path = self.custom_image_path(slot)
+        return path.name if path else "未设置（保持默认）"
+
+    def get_custom_photo(self, slot: str) -> object | None:
+        path = self.custom_image_path(slot)
+        if path is None:
+            self._custom_photo_cache.pop(slot, None)
+            return None
+        try:
+            signature = f"{path}:{path.stat().st_mtime_ns}:{path.stat().st_size}"
+        except OSError:
+            return None
+        cached = self._custom_photo_cache.get(slot)
+        if cached and cached[0] == signature:
+            return cached[1]
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as image:
+                image.load()
+                photo = ImageTk.PhotoImage(image.copy())
+        except Exception as exc:
+            if hasattr(self, "status_var"):
+                self.set_status(f"无法加载自定义图片：{exc}")
+            return None
+        self._custom_photo_cache[slot] = (signature, photo)
+        return photo
+
+    def refresh_custom_images(self) -> None:
+        self._custom_photo_cache.clear()
+        sidebar_photo = self.get_custom_photo("sidebar")
+        if hasattr(self, "sidebar_art_label"):
+            if sidebar_photo is None:
+                self.sidebar_art_label.configure(image="")
+                self.sidebar_art_label.image = None
+                self.sidebar_art_frame.grid_remove()
+            else:
+                self.sidebar_art_label.configure(image=sidebar_photo)
+                self.sidebar_art_label.image = sidebar_photo
+                self.sidebar_art_frame.grid()
+        for panel in getattr(self, "panel_instances", {}).values():
+            panel.update_custom_images()
+
+    def set_custom_image(self, slot: str, source: Path) -> bool:
+        if slot not in CUSTOMIZATION_SLOTS or source.suffix.lower() not in CUSTOMIZATION_EXTENSIONS:
+            messagebox.showerror("图片格式不支持", "请选择 PNG、JPG、WebP、BMP 或 GIF 图片。", parent=self)
+            return False
+        try:
+            from PIL import Image
+
+            with Image.open(source) as image:
+                image.load()
+        except Exception as exc:
+            messagebox.showerror("图片读取失败", f"无法读取图片：\n\n{exc}", parent=self)
+            return False
+        try:
+            destination = self._normalize_custom_image(slot, source)
+            self.settings[f"custom_{slot}_image"] = str(
+                destination.relative_to(project_dir())
+            ).replace("\\", "/")
+            save_app_settings(self.settings)
+        except OSError as exc:
+            messagebox.showerror("图片保存失败", f"无法复制图片到软件目录：\n\n{exc}", parent=self)
+            return False
+        self.refresh_custom_images()
+        self.set_status(f"已设置{CUSTOMIZATION_SLOTS[slot][0]}：{destination.name}")
+        return True
+
+    def clear_custom_image(self, slot: str) -> None:
+        path = self.custom_image_path(slot)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        self.settings.pop(f"custom_{slot}_image", None)
+        save_app_settings(self.settings)
+        self.refresh_custom_images()
+        self.set_status(f"已清除{CUSTOMIZATION_SLOTS.get(slot, ('自定义图片', (0, 0)))[0]}")
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self)
@@ -1794,9 +2099,21 @@ class ReaderApp(tk.Tk):
         self.nav_frame.grid(row=2, column=0, sticky="new")
         self.nav_frame.columnconfigure(0, weight=1)
 
+        self.sidebar_art_frame = ttk.Frame(self.sidebar, style="Sidebar.TFrame")
+        self.sidebar_art_frame.grid(row=3, column=0, sticky="nw", pady=(12, 0))
+        self.sidebar_art_label = tk.Label(
+            self.sidebar_art_frame,
+            bg="#f7f8fa",
+            borderwidth=0,
+            highlightthickness=0,
+            anchor="nw",
+        )
+        self.sidebar_art_label.grid(row=0, column=0, sticky="nw")
+
         self.global_controls = ttk.Frame(self.sidebar, style="Global.TFrame", padding=12)
-        self.global_controls.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        self.global_controls.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         self._build_global_controls()
+        self.refresh_custom_images()
 
         self.workspace = ttk.Frame(body, style="Workspace.TFrame")
         self.workspace.grid(row=0, column=1, sticky="nsew")
@@ -1882,6 +2199,7 @@ class ReaderApp(tk.Tk):
             self.active_panel.grid_remove()
         panel = self.panel_instances.get(key)
         if panel is None:
+            self._building_module_key = key
             panel = spec.panel(self.workspace, self)
             self.panel_instances[key] = panel
         panel.grid(row=0, column=0, sticky="nsew")

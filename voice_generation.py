@@ -47,6 +47,11 @@ EDGE_VOICES = (
     "zh-CN-XiaoyiNeural",
     "zh-CN-YunyangNeural",
 )
+# Edge-TTS occasionally returns an empty stream when the online service or
+# connection is temporarily unavailable. Keep retries local to one segment so
+# completed audio is preserved and the queue does not need to restart.
+EDGE_RETRY_DELAYS = (1.0, 2.0, 4.0)
+EDGE_REQUEST_GAP = 0.2
 QWEN_VOICES = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee", "Ryan", "Aiden")
 
 
@@ -76,7 +81,10 @@ def speed_to_edge_rate(speed: float) -> str:
 def prepare_external_runtime() -> None:
     """Make packages beside a frozen EXE importable without bundling them."""
     runtime_python = project_dir() / "runtime" / "python"
+    standard_library = runtime_python / "Lib"
     site_packages = runtime_python / "Lib" / "site-packages"
+    if standard_library.is_dir() and str(standard_library) not in sys.path:
+        sys.path.insert(0, str(standard_library))
     if site_packages.is_dir() and str(site_packages) not in sys.path:
         sys.path.insert(0, str(site_packages))
     if os.name == "nt":
@@ -128,7 +136,7 @@ def _qwen_runtime_candidates() -> list[Path]:
 
 
 def locate_qwen_runtime(mode: str = QWEN_MODE_CUSTOM) -> tuple[Path, Path, Path, Path] | None:
-    """Return runtime root, Python, model and tokenizer from ver0.5."""
+    """Return the optional local-model runtime beside the application."""
     for runtime in _qwen_runtime_candidates():
         python = runtime / "python" / "python.exe"
         script = runtime / "tts_server.py"
@@ -190,7 +198,7 @@ class QwenClient:
             self.process = None
             # Always call the endpoint, even when this GUI instance lost its
             # Popen handle after a module was recreated. This also releases a
-            # Qwen server left behind by an older ver0.5 process.
+            # Qwen server left behind by an older application process.
             request_sent = False
             try:
                 self._request("/shutdown", {}, timeout=3)
@@ -221,7 +229,7 @@ class QwenClient:
         located = locate_qwen_runtime(mode)
         if located is None:
             raise RuntimeError(
-                "找不到 ver0.5/runtime 中的 Qwen3-TTS 运行时，请确认软件目录完整。"
+                "找不到应用目录 runtime 中的 Qwen3-TTS 运行时，请确认已按文档准备可选模型环境。"
             )
         runtime, python, model, tokenizer = located
         script = runtime / "tts_server.py"
@@ -305,12 +313,27 @@ class TTSBackendManager:
         import edge_tts
 
         async def save() -> bytes:
-            communicate = edge_tts.Communicate(text, voice, rate=speed_to_edge_rate(speed))
-            chunks: list[bytes] = []
-            async for item in communicate.stream():
-                if item["type"] == "audio":
-                    chunks.append(item["data"])
-            return b"".join(chunks)
+            last_error: Exception | None = None
+            for attempt in range(len(EDGE_RETRY_DELAYS) + 1):
+                if attempt:
+                    await asyncio.sleep(EDGE_RETRY_DELAYS[attempt - 1])
+                elif EDGE_REQUEST_GAP:
+                    await asyncio.sleep(EDGE_REQUEST_GAP)
+                try:
+                    communicate = edge_tts.Communicate(text, voice, rate=speed_to_edge_rate(speed))
+                    chunks: list[bytes] = []
+                    async for item in communicate.stream():
+                        if item.get("type") == "audio" and item.get("data"):
+                            chunks.append(item["data"])
+                    audio = b"".join(chunks)
+                    if audio:
+                        return audio
+                    last_error = RuntimeError("No audio was received")
+                except Exception as exc:
+                    last_error = exc
+            raise RuntimeError(
+                f"Edge-TTS failed after {len(EDGE_RETRY_DELAYS) + 1} attempts: {last_error}"
+            ) from last_error
 
         return asyncio.run(save())
 

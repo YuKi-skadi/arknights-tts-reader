@@ -113,6 +113,7 @@ Qwen3-TTS 的接口适配代码仍保留在 `voice_generation.py` 和 `runtime/t
 详细接入方法请阅读：
 
 - [可选大模型 TTS 接入指南](docs/OPTIONAL_TTS_GUIDE.md)
+- [Windows EXE 构建与发布说明](docs/WINDOWS_PACKAGING.md)
 - [给开发者和 Agent 的项目说明](AGENTS.md)
 
 ## 💻 平台与硬件支持

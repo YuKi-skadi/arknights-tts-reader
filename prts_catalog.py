@@ -95,7 +95,7 @@ def parse_navigation(raw: str) -> tuple[StorySegment, ...]:
             active_table = "maintheme"
         elif "活动剧情一览" in block:
             active_table = "activity"
-        if active_table is None or "|}" in block:
+        if active_table is None:
             continue
 
         links = [(target.strip(), (label or target).strip()) for target, label in _LINK_RE.findall(block)]
@@ -103,10 +103,10 @@ def parse_navigation(raw: str) -> tuple[StorySegment, ...]:
         if not links:
             continue
         cell_data = _cells(block)
+        values = {value for _attrs, value in cell_data}
         if active_table == "maintheme":
-            category = "maintheme"
+            category = "storyset" if "剧情" in values else "maintheme"
         else:
-            values = {value for _attrs, value in cell_data}
             category = "storyset" if "剧情" in values else "sidestory"
         name = _event_name(cell_data, category)
         event_key = f"{name}|{links[0][0]}"
@@ -127,6 +127,8 @@ def parse_navigation(raw: str) -> tuple[StorySegment, ...]:
                 )
             )
             order += 1
+        if "|}" in block:
+            active_table = None
     return tuple(segments)
 
 
