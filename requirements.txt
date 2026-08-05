@@ -1,0 +1,10 @@
+# Core online and local Windows TTS options.
+edge-tts>=7.0.0
+
+# OCR, screen capture image handling and audio playback.
+Pillow>=10.0.0
+rapidocr_onnxruntime>=1.4.4
+playsound3>=3.3.2
+
+# Optional DeepSeek emotion analysis uses Python's standard urllib client;
+# it does not require an additional SDK. Never commit an API key.

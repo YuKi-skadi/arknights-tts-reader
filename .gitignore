@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+build/
+dist/
+*.spec
+*.exe
+
+# Runtime data created by the application.
+data/*
+!data/.gitkeep
+
+# Optional local model/runtime installation.
+runtime/python/
+runtime/models/
+runtime/cache/
+runtime/rocm/
+
+# Local secrets and debug artifacts.
+.env
+*.log
+data/debug/
