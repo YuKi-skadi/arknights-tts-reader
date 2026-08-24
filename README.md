@@ -1,182 +1,219 @@
 # 明日方舟剧情阅读器
 
-⚠️ **免责声明**：本项目 100% 由 AI 构建，虽然已经经过实际测试，但仍可能存在不可预见的 Bug。使用前请自行评估风险，作者不对因使用本软件造成的任何损失负责。
+一个面向剧情阅读和无障碍使用场景的 Windows 桌面工具：下载《明日方舟》剧情文本，使用 TTS 预生成语音，再通过 OCR 识别屏幕上的台词并自动播放对应语音。
 
-[![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](#平台与硬件支持)
-[![GPU](https://img.shields.io/badge/GPU-AMD%20%7C%20ROCm-red.svg)](#平台与硬件支持)
-[![AI](https://img.shields.io/badge/Made%20with-100%25%20AI-purple.svg)](#关于项目)
+> 本项目主要由 AI 协助开发，仍可能存在未发现的问题。使用前请自行备份剧情、语音和配置数据。
 
-**将明日方舟剧情转换为可匹配播放的语音，支持剧情下载、预生成语音、OCR 监听和本地 TTS**
+## 当前状态
 
-> 先下载剧情并生成语音，阅读时通过 OCR 匹配对应片段 | 支持 Edge-TTS 和 Windows 本地语音 | 面向无障碍阅读场景
+- UI 已从 Tkinter 迁移到 PySide6 / Qt。
+- 主要验证环境：Windows 10/11。
+- 支持 Edge-TTS、Windows SAPI 和可选的 Qwen3-TTS。
+- Qwen3-TTS 支持 0.6B、1.7B、声音克隆、AMD ROCm、NVIDIA CUDA 和自动后端检测。
+- 源代码仓库不包含 EXE、portable Python、GPU runtime、PyTorch 或模型权重。
 
-## ✨ 核心功能
+## 功能
 
-### 📚 剧情资源
+### 剧情下载
 
-- 从 [PRTS Wiki](https://prts.wiki/w/剧情一览) 获取剧情导航和剧情文本；
-- 支持主题曲、别传、故事集；
-- 自动处理角色名、旁白和对白文本；
-- 支持 Ctrl/Shift 多选、任务队列、暂停、停止和下载日志；
-- 剧情文件按“分类 → 活动 → 剧情段落”保存。
+- 从 PRTS Wiki 获取剧情目录和文本。
+- 支持主题曲、别传、故事集。
+- 支持多选、下载队列、暂停、停止和下载日志。
+- 剧情文件按分类、活动和剧情段落保存。
 
-### 🔉 语音生成
+### 语音生成
 
-- **Edge-TTS**：在线神经语音，音质自然，支持多种中文音色；
-- **Windows 本地 TTS**：使用系统 SAPI，速度快、不依赖在线服务；
-- 按剧情段落预生成音频，阅读时无需等待合成；
-- 支持语速调节、队列排序、暂停后继续；
-- 每句独立记录状态，失败片段可查看并单独重试；
-- 生成结果包含 `manifest.json`，用于后续 OCR 精确匹配；
-- 可选使用 DeepSeek 为 Qwen3-TTS 等大模型生成逐句情绪提示。
+- Edge-TTS 在线神经语音。
+- Windows SAPI 本地语音。
+- Qwen3-TTS 0.6B / 1.7B。
+- Qwen3-TTS 预设音色和声音克隆。
+- AMD ROCm、NVIDIA CUDA、自动检测。
+- 支持 TXT、Markdown、LOG 自定义文本。
+- 自定义文本同名导入时自动添加“（1）”“（2）”后缀。
+- 任务会保存引擎、模型、显卡后端、音色、语速和参考音频。
+- 生成队列持久化，关闭软件后可以继续。
+- 每次队列运行中每条剧情只尝试一次；失败或部分完成的任务不会自动循环重试。
+- 所有语音片段写入 manifest.json，成功片段可以断点复用，失败片段可以查看日志后手动重试。
+- 队列支持按未完成、已完成、部分完成、失败/中断和全部筛选。
 
-### 👁️ OCR 朗读监听
+### OCR 朗读监听
 
-- 自定义框选游戏台词区域；
-- RapidOCR 识别不同背景下的台词；
-- 根据当前剧情位置附近的文本进行匹配，降低短句误匹配；
-- 同一句 OCR 文本不会反复打断播放；
-- 支持调速、开始/停止监听和当前语音包选择。
+- 自定义框选屏幕上的游戏台词区域。
+- 使用 RapidOCR 识别台词。
+- 根据当前语音包附近文本进行匹配，降低短句误匹配。
+- 支持选择语音包、开始/停止监听和朗读速度调整。
 
-### 🧰 资源管理
+### 资源管理
 
-- 统一管理剧情资源、语音资源、下载缓存和情绪分析缓存；
-- 支持 Ctrl 多选；
-- 支持右键删除资源；
-- 可清理 Qwen/ROCm 运行缓存；
-- 监听语音包选择放在“朗读监听”模块中，逻辑更直观。
+- 按剧情、语音、自定义语音、自定义文本、下载缓存和运行缓存分类。
+- 支持多选删除。
+- 自定义语音可以按语音名导出到指定目录。
+- 监听语音包统一在“朗读监听”模块中选择。
 
-## 🚀 快速开始
+## 快速开始
 
-本仓库是**纯源代码版本**，不包含 EXE、portable Python、ROCm、PyTorch、Qwen3-TTS 模型或其他大型运行时文件。
+### 环境要求
 
-### 1. 创建 Python 环境
+- Windows 10 或 Windows 11
+- Python 3.12
+- Edge-TTS 需要网络连接
+- OCR 需要 Windows 屏幕捕获和 RapidOCR 依赖
+- Qwen3-TTS 需要单独准备匹配的模型和 GPU runtime
 
-建议使用 Python 3.11 或 3.12：
+### 安装依赖
 
-```powershell
+~~~powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\\.venv\\Scripts\\Activate.ps1
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
+~~~
 
-### 2. 启动程序
+### 启动
 
-```powershell
-python .\main.py
-```
+~~~powershell
+python .\\main.py
+~~~
 
-检查模块是否可以导入：
+检查模块：
 
-```powershell
-python .\main.py --check
-```
+~~~powershell
+python .\\main.py --check
+~~~
 
-### 3. 推荐使用流程
+### 推荐使用流程
 
-1. 打开“剧情下载”，刷新剧情目录并选择剧情段落；
-2. 下载并导出剧情；
-3. 打开“语音生成”，选择 Edge-TTS 或 Windows 系统语音；
-4. 将剧情加入生成队列，生成对应语音包；
-5. 打开“朗读监听”，选择当前语音包并框选游戏台词区域；
-6. 进入游戏剧情，点击开始监听。
+1. 在“剧情下载”中刷新目录并加入下载队列。
+2. 下载完成后，在“语音生成”中选择语音引擎和音色。
+3. 将剧情或自定义文本加入语音生成队列。
+4. 生成完成后，在“朗读监听”中选择语音包。
+5. 点击“选择台词区域”，框选游戏台词位置。
+6. 开始游戏剧情并启动朗读监听。
 
-## ⚙️ TTS 配置
+## TTS 配置
 
 ### Edge-TTS
 
-Edge-TTS 需要网络，不需要 API Key。当前代码内置的中文音色包括：
+Edge-TTS 不需要 API Key，但需要网络。常用中文音色包括：
 
-| 音色 | 适用场景 |
-|---|---|
-| `zh-CN-XiaoxiaoNeural` | 通用女声 |
-| `zh-CN-YunxiNeural` | 年轻男声 |
-| `zh-CN-YunjianNeural` | 沉稳男声 |
-| `zh-CN-XiaoyiNeural` | 轻快女声 |
+| 音色 | 说明 |
+| --- | --- |
+| zh-CN-XiaoxiaoNeural | 通用女声 |
+| zh-CN-YunxiNeural | 年轻男声 |
+| zh-CN-YunjianNeural | 沉稳男声 |
+| zh-CN-XiaoyiNeural | 轻快女声 |
 
-### Windows 本地 TTS
+### Windows SAPI
 
-本地 TTS 使用 Windows SAPI，不需要网络或大模型。可用音色取决于系统中安装的语音包，适合追求稳定速度和低资源占用的场景。
+Windows SAPI 使用系统已安装的语音包，不需要额外模型或网络。可用音色由 Windows 系统决定。
 
-## 🤖 可选大模型 TTS
+### Qwen3-TTS
 
-Qwen3-TTS 的接口适配代码仍保留在 `voice_generation.py` 和 `runtime/tts_server.py` 中，但模型和运行环境没有放进本仓库。
+Qwen3-TTS 使用独立服务进程，GUI 不直接导入大型模型。
 
-启用本地大模型通常需要自行准备：
+| 模型 | 建议 |
+| --- | --- |
+| 0.6B | 适合 6GB 显存设备，优先用于 RTX 3060 Laptop 等设备 |
+| 1.7B | 需要更多显存，实际占用取决于精度、后端、句子长度和服务配置 |
 
-- 模型权重和 tokenizer；
-- PyTorch 或其他推理框架；
-- ROCm、CUDA 或 MPS 等硬件后端；
-- 音频编解码和参考音频处理依赖；
-- 与模型匹配的 Python 环境。
+声音克隆需要对应的 Base 模型和参考音频。任务会锁定当时使用的模型、后端和参考音频；如果参考音频路径失效，继续任务时会提示重新选择。
 
-详细接入方法请阅读：
+Qwen runtime 和模型不提交到 GitHub。可参考：
 
-- [可选大模型 TTS 接入指南](docs/OPTIONAL_TTS_GUIDE.md)
-- [Windows EXE 构建与发布说明](docs/WINDOWS_PACKAGING.md)
-- [给开发者和 Agent 的项目说明](AGENTS.md)
+- docs/OPTIONAL_TTS_GUIDE.md
+- docs/WINDOWS_PACKAGING.md
 
-## 💻 平台与硬件支持
+## GPU 后端
 
-当前项目以 **Windows + AMD 显卡 + ROCm** 为主要验证环境。
+| 后端 | 状态 | 说明 |
+| --- | --- | --- |
+| NVIDIA CUDA | 支持 | 需要 NVIDIA 驱动、CUDA 对应 PyTorch 和 Qwen runtime |
+| AMD ROCm | 支持 | 需要 AMD 驱动、ROCm 对应 PyTorch 和 Qwen runtime |
+| 自动检测 | 支持 | 优先根据系统环境选择 CUDA 或 ROCm |
 
-| 平台 | 当前状态 | 需要注意 |
-|---|---|---|
-| Windows + AMD | ✅ 主要验证平台 | Qwen3-TTS 可使用 ROCm，需匹配驱动和 PyTorch |
-| Windows + NVIDIA | ⚠️ 可改造 | 将 ROCm/PyTorch 后端替换为 CUDA，并调整设备和显存释放逻辑 |
-| macOS | ⚠️ 需要改造 | 屏幕捕获使用 ScreenCaptureKit，系统语音改用 `say`/AVFoundation，模型可尝试 MPS |
-| Linux | ⚠️ 需要改造 | 需要替换屏幕捕获、系统语音和窗口相关逻辑 |
+AMD 和 NVIDIA 的 PyTorch runtime 通常不能直接共用。建议分别维护 runtime 和 runtime_cuda，不要在同一个 Python 环境中混装两套 GPU PyTorch。
 
-硬件相关代码应集中在 TTS 服务和平台适配层，不要把 CUDA、ROCm 或 MPS 判断散落到 GUI、剧情解析和 OCR 匹配逻辑中。
+## 项目结构
 
-## 📂 项目结构
-
-```text
+~~~text
 arknights-tts-reader/
-├── main.py                  # Tkinter GUI 和模块编排
-├── prts_catalog.py          # PRTS 剧情目录与下载
-├── story_catalog.py         # 剧情数据模型和文本预处理
-├── voice_generation.py      # Edge/SAPI/Qwen 后端与语音包生成
-├── reader_engine.py         # OCR、匹配和音频播放
+├── main.py                  # Qt 应用入口
+├── qt_main.py               # Qt 应用壳、导航和全局监听生命周期
+├── qt_base.py               # Qt 面板基类、卡片和通用样式
+├── qt_story.py              # 剧情下载界面
+├── qt_voice.py              # 语音生成和队列界面
+├── qt_voice_packs.py        # 资源管理界面
+├── qt_reader.py             # 朗读监听界面
+├── qt_settings.py           # 设置界面
+├── app_runtime.py           # 便携目录、DPI 和设置读写
+├── ui_config.py             # UI 配置常量
+├── prts_catalog.py          # PRTS 剧情目录和下载
+├── story_catalog.py         # 剧情数据模型和文本处理
+├── voice_generation.py      # TTS 后端和逐句语音包生成
+├── voice_queue.py           # 语音队列持久化
+├── reader_engine.py         # OCR、文本匹配和音频播放
 ├── quality_analysis.py      # 可选 DeepSeek 情绪分析
 ├── runtime/
-│   └── tts_server.py        # 可选本地模型 HTTP 服务示例
+│   └── tts_server.py        # Qwen 服务端参考实现
+├── assets/
+│   └── app_icon.ico         # 应用图标
 ├── docs/
-│   └── OPTIONAL_TTS_GUIDE.md
-├── requirements.txt         # 基础依赖
-├── AGENTS.md                # 开发者和 Agent 使用说明
-└── data/                    # 运行时自动生成，仓库只保留 .gitkeep
-```
+│   ├── OPTIONAL_TTS_GUIDE.md
+│   └── WINDOWS_PACKAGING.md
+├── requirements.txt
+├── requirements-build.txt
+└── data/
+    └── .gitkeep             # 运行时数据目录占位文件
+~~~
 
-运行后会在 `data/` 下生成：
+运行后会在 data/ 下生成：
 
-```text
+~~~text
 data/
-├── stories/       # 剧情 JSON
-├── voice_packs/   # 音频和 manifest.json
-├── cache/prts/    # PRTS 页面缓存
-├── tts_analysis/  # DeepSeek 分析缓存
-├── qwen_cache/    # 可选 Qwen/ROCm 缓存
-└── settings.json  # 本地设置
-```
+├── stories/                 # 剧情 JSON
+├── custom_texts/            # 自定义文本
+├── voice_packs/             # 音频和 manifest.json
+├── voice_generation_queue.json
+├── cache/prts/              # PRTS 页面缓存
+├── tts_analysis/            # DeepSeek 分析缓存
+├── qwen_cache/              # Qwen 运行缓存
+└── settings.json            # 本地设置
+~~~
 
-## 🛠️ 二次开发
+## Windows 封装
 
-新增 TTS 后端时，建议遵循以下原则：
+源码仓库不包含大型运行时。准备好 Python 3.12 和构建依赖后：
 
-1. 通过统一的 `synthesize()` 接口返回音频；
-2. 将大型模型放在独立服务进程中；
-3. 每句生成后立即更新 manifest；
-4. 失败句不能影响已完成片段；
-5. 暂停、停止、重试和显存释放必须可观察；
-6. API Key、模型权重和用户数据不能提交到仓库。
+~~~powershell
+py -3.12 -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+python -m pip install -r requirements-build.txt
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\build_windows.ps1
+~~~
 
-## 📜 许可证与第三方资源
+脚本会在源码目录生成 ArknightsTTSReader.exe。发布时还需要根据目标机器准备：
 
-本项目当前不携带第三方模型和运行时。使用 Edge-TTS、RapidOCR、playsound3、模型权重、声音样本和剧情数据时，请分别遵守其许可证、服务条款和数据使用规则。
+- assets/
+- runtime/ 或 runtime_cuda/
+- 对应的 Python、PyTorch、ROCm/CUDA runtime
+- Qwen3-TTS 模型和 tokenizer
 
-## 🤝 关于项目
+模型、语音、剧情、参考音频、API Key 和用户数据不应放入 GitHub 仓库。
 
-这是一个由需求驱动、由 AI 完成主要设计与实现的实验性无障碍工具。项目的代码、UI、文档、调试方案和跨平台建议均由 AI 生成或协助完成，人工负责实际运行测试、提出修改意见和确认功能结果。
+## 二次开发
 
-> 让剧情阅读不再依赖视觉，也让本地 AI 工具保持开放和可改造。
+- GUI 逻辑放在 qt_*.py，TTS 逻辑放在 voice_generation.py。
+- 不要在 Qt GUI 进程中直接加载大型 TTS 模型。
+- 新增 TTS 后端时，使用统一的 TTSBackendManager 合成接口。
+- 每句生成后及时写入 manifest，失败不得丢失已经成功的片段。
+- 队列状态、暂停、停止、重试和显存释放需要有明确的 UI 状态。
+- 不要提交 API Key、模型权重、参考音频、生成音频、剧情数据和运行时缓存。
+
+## 许可证与第三方资源
+
+本项目不携带第三方模型和 GPU runtime。使用 Edge-TTS、RapidOCR、playsound3、Qwen3-TTS、模型权重、声音样本和剧情数据时，请分别遵守其许可证、服务条款和数据使用规则。
+
+## 关于项目
+
+这是一个由需求驱动、由 AI 协助完成主要设计与实现的实验性工具。欢迎提交问题、改进建议和适用于不同硬件环境的测试反馈。
+

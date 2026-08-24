@@ -16,8 +16,11 @@ runtime/python/
 runtime/models/
 runtime/cache/
 runtime/rocm/
+runtime_cuda/
 
 # Local secrets and debug artifacts.
 .env
 *.log
 data/debug/
+.pytest_cache/
+.mypy_cache/

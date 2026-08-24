@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -23,8 +24,23 @@ from typing import Callable
 
 
 ENGINE_EDGE = "edge-tts"
+# Keep the old identifier for queue files created before the model selector
+# was split into 0.6B and 1.7B. It is normalized to the existing 1.7B model.
 ENGINE_QWEN = "qwen3-tts"
+ENGINE_QWEN_06B = "qwen3-tts-0.6b"
+ENGINE_QWEN_17B = "qwen3-tts-1.7b"
 ENGINE_SYSTEM = "windows-sapi"
+
+QWEN_ENGINE_IDS = (ENGINE_QWEN_06B, ENGINE_QWEN_17B)
+
+GPU_BACKEND_AUTO = "auto"
+GPU_BACKEND_CUDA = "cuda"
+GPU_BACKEND_ROCM = "rocm"
+GPU_BACKEND_LABELS = {
+    GPU_BACKEND_AUTO: "自动检测",
+    GPU_BACKEND_CUDA: "NVIDIA CUDA",
+    GPU_BACKEND_ROCM: "AMD ROCm",
+}
 
 QWEN_MODE_CUSTOM = "custom_voice"
 QWEN_MODE_CLONE = "voice_clone"
@@ -36,7 +52,9 @@ QWEN_CLONE_VOICE = "自定义克隆"
 
 ENGINE_LABELS = {
     ENGINE_EDGE: "Edge-TTS（在线）",
-    ENGINE_QWEN: "Qwen3-TTS（本地 ROCm）",
+    ENGINE_QWEN: "Qwen3-TTS 1.7B（旧任务）",
+    ENGINE_QWEN_06B: "Qwen3-TTS 0.6B",
+    ENGINE_QWEN_17B: "Qwen3-TTS 1.7B",
     ENGINE_SYSTEM: "Windows 系统语音",
 }
 
@@ -53,6 +71,48 @@ EDGE_VOICES = (
 EDGE_RETRY_DELAYS = (1.0, 2.0, 4.0)
 EDGE_REQUEST_GAP = 0.2
 QWEN_VOICES = ("Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", "Ono_Anna", "Sohee", "Ryan", "Aiden")
+
+
+def is_qwen_engine(engine: str) -> bool:
+    return engine in QWEN_ENGINE_IDS or engine == ENGINE_QWEN
+
+
+def normalize_qwen_engine(engine: str) -> str:
+    """Migrate the pre-model-selector engine id without changing its behavior."""
+    return ENGINE_QWEN_17B if engine == ENGINE_QWEN else engine
+
+
+def qwen_model_size(engine: str) -> str:
+    engine = normalize_qwen_engine(engine)
+    if engine == ENGINE_QWEN_06B:
+        return "0.6B"
+    if engine == ENGINE_QWEN_17B:
+        return "1.7B"
+    return ""
+
+
+def detect_gpu_backend() -> str | None:
+    """Detect a vendor without importing torch into the GUI process."""
+    if os.name == "nt" and shutil.which("nvidia-smi"):
+        return GPU_BACKEND_CUDA
+    if shutil.which("rocminfo") or os.environ.get("ROCM_PATH") or os.environ.get("HIP_PATH"):
+        return GPU_BACKEND_ROCM
+    return None
+
+
+def resolve_gpu_backend(selected: str = GPU_BACKEND_AUTO) -> str:
+    """Resolve the UI choice to a locked backend used by a queue task."""
+    if selected in {GPU_BACKEND_CUDA, GPU_BACKEND_ROCM}:
+        return selected
+    detected = detect_gpu_backend()
+    if detected:
+        return detected
+    # The existing portable runtime is ROCm. Keep old AMD installations
+    # usable even when rocminfo is not on PATH.
+    root = project_dir()
+    if (root / "runtime" / "python" / "python.exe").exists():
+        return GPU_BACKEND_ROCM
+    return GPU_BACKEND_CUDA
 
 
 class GenerationInterrupted(RuntimeError):
@@ -115,13 +175,19 @@ def prepare_external_runtime() -> None:
         os.environ["PATH"] = os.pathsep.join(prefix + existing_path)
 
 
-def runtime_environment(cache_root: Path) -> dict[str, str]:
+def runtime_environment(cache_root: Path, backend: str = GPU_BACKEND_ROCM) -> dict[str, str]:
     environment = {key.upper(): value for key, value in os.environ.items()}
     cache_root.mkdir(parents=True, exist_ok=True)
     (cache_root / "kernels").mkdir(parents=True, exist_ok=True)
     environment["PYTHONUTF8"] = "1"
-    environment["MIOPEN_USER_DB_PATH"] = str(cache_root)
-    environment["MIOPEN_CUSTOM_CACHE_DIR"] = str(cache_root / "kernels")
+    if backend == GPU_BACKEND_CUDA:
+        # Keep CUDA's kernel/cache files separate from the ROCm runtime.
+        environment["CUDA_MODULE_LOADING"] = "LAZY"
+        environment.pop("MIOPEN_USER_DB_PATH", None)
+        environment.pop("MIOPEN_CUSTOM_CACHE_DIR", None)
+    else:
+        environment["MIOPEN_USER_DB_PATH"] = str(cache_root)
+        environment["MIOPEN_CUSTOM_CACHE_DIR"] = str(cache_root / "kernels")
     return environment
 
 
@@ -130,38 +196,56 @@ def _safe_part(value: str, default: str = "item") -> str:
     return value[:100] or default
 
 
-def _qwen_runtime_candidates() -> list[Path]:
+def _qwen_runtime_candidates(backend: str) -> list[Path]:
     root = project_dir()
+    if backend == GPU_BACKEND_CUDA:
+        return [root / "runtime_cuda", root / "runtime" / "cuda"]
     return [root / "runtime"]
 
 
-def locate_qwen_runtime(mode: str = QWEN_MODE_CUSTOM) -> tuple[Path, Path, Path, Path] | None:
+def locate_qwen_runtime(
+    mode: str = QWEN_MODE_CUSTOM,
+    model_size: str = "1.7B",
+    backend: str = GPU_BACKEND_AUTO,
+) -> tuple[Path, Path, Path, Path] | None:
     """Return the optional local-model runtime beside the application."""
-    for runtime in _qwen_runtime_candidates():
+    backend = resolve_gpu_backend(backend)
+    root = project_dir()
+    for runtime in _qwen_runtime_candidates(backend):
         python = runtime / "python" / "python.exe"
         script = runtime / "tts_server.py"
-        tokenizer = runtime / "models" / "Qwen3-TTS-Tokenizer-12Hz"
         if not python.exists() or not script.exists():
             continue
+        # CUDA and ROCm may use different Python runtimes, but the large
+        # weights are shared from the existing runtime/models directory.
+        model_root = runtime / "models"
+        shared_model_root = root / "runtime" / "models"
+        if not (model_root / "Qwen3-TTS-Tokenizer-12Hz").is_dir() and shared_model_root.is_dir():
+            model_root = shared_model_root
+        tokenizer = model_root / "Qwen3-TTS-Tokenizer-12Hz"
+        prefix = f"Qwen3-TTS-12Hz-{model_size}-"
         model_names = {
-            QWEN_MODE_CUSTOM: ("Qwen3-TTS-12Hz-1.7B-CustomVoice",),
-            QWEN_MODE_CLONE: ("Qwen3-TTS-12Hz-1.7B-Base",),
+            QWEN_MODE_CUSTOM: (f"{prefix}CustomVoice",),
+            QWEN_MODE_CLONE: (f"{prefix}Base",),
         }.get(mode, ())
         for model_name in model_names:
-            model = runtime / "models" / model_name
+            model = model_root / model_name
             if (model / "config.json").exists():
                 return runtime, python, model, tokenizer
     return None
 
 
 class QwenClient:
-    """HTTP client that owns a separate Qwen/ROCm server process."""
+    """HTTP client that owns a separate Qwen/CUDA or Qwen/ROCm process."""
 
     def __init__(self, status: Callable[[str], None] | None = None, port: int = 47832) -> None:
         self.status = status or (lambda _text: None)
         self.port = port
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self.active_mode = QWEN_MODE_CUSTOM
+        self.active_model_size = ""
+        self.active_backend = ""
 
     def synthesize(
         self,
@@ -169,11 +253,13 @@ class QwenClient:
         voice: str,
         speed: float,
         mode: str = QWEN_MODE_CUSTOM,
+        model_size: str = "1.7B",
+        backend: str = GPU_BACKEND_AUTO,
         reference_audio: str = "",
         reference_text: str = "",
         instruct: str = "",
     ) -> bytes:
-        self._ensure_server(mode)
+        self._ensure_server(mode, model_size, backend)
         try:
             return self._request(
                 "/synthesize",
@@ -221,19 +307,29 @@ class QwenClient:
 
     close = release
 
-    def _ensure_server(self, mode: str) -> None:
+    def _ensure_server(self, mode: str, model_size: str, backend: str) -> None:
+        backend = resolve_gpu_backend(backend)
         if self.process is not None and self.process.poll() is None:
-            if getattr(self, "active_mode", mode) == mode:
+            if (
+                getattr(self, "active_mode", mode) == mode
+                and getattr(self, "active_model_size", model_size) == model_size
+                and getattr(self, "active_backend", backend) == backend
+            ):
                 return
             self.release()
-        located = locate_qwen_runtime(mode)
+        located = locate_qwen_runtime(mode, model_size, backend)
         if located is None:
             raise RuntimeError(
-                "找不到应用目录 runtime 中的 Qwen3-TTS 运行时，请确认已按文档准备可选模型环境。"
+                f"找不到 {backend.upper()} 的 Qwen3-TTS {model_size} 运行时或对应模型，请检查 runtime_{'cuda' if backend == GPU_BACKEND_CUDA else ''} 和 models 目录。"
             )
         runtime, python, model, tokenizer = located
         script = runtime / "tts_server.py"
-        command = [str(python), str(script), "--port", str(self.port), "--model-dir", str(model)]
+        command = [
+            str(python), str(script),
+            "--port", str(self.port),
+            "--model-dir", str(model),
+            "--backend", backend,
+        ]
         if tokenizer.is_dir():
             command.extend(["--tokenizer-dir", str(tokenizer)])
         self.process = subprocess.Popen(
@@ -243,15 +339,19 @@ class QwenClient:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=runtime_environment(project_dir() / "data" / "qwen_cache"),
+            env=runtime_environment(project_dir() / "data" / "qwen_cache" / backend, backend),
         )
         self.active_mode = mode
-        self.status(f"正在启动 Qwen3-TTS：{runtime}")
+        self.active_model_size = model_size
+        self.active_backend = backend
+        self.status(f"正在启动 Qwen3-TTS {model_size}（{GPU_BACKEND_LABELS.get(backend, backend)}）：{runtime}")
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 self.process = None
-                raise RuntimeError("Qwen3-TTS 服务启动失败，请检查 ROCm 运行时和模型文件")
+                raise RuntimeError(
+                    f"Qwen3-TTS 服务启动失败，请检查 {GPU_BACKEND_LABELS.get(backend, backend)} 运行时、显卡驱动和模型文件"
+                )
             try:
                 self._request("/health", None, timeout=2)
                 return
@@ -268,8 +368,17 @@ class QwenClient:
             method="POST" if data is not None else "GET",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                detail = str(body.get("error", "")) if isinstance(body, dict) else ""
+            except (OSError, UnicodeError, ValueError, TypeError):
+                pass
+            raise RuntimeError(detail or f"Qwen 服务返回 HTTP {exc.code}") from exc
 
 
 class TTSBackendManager:
@@ -287,13 +396,16 @@ class TTSBackendManager:
     ) -> tuple[bytes, str]:
         if engine == ENGINE_EDGE:
             return self._edge(text, voice, speed), "mp3"
-        if engine == ENGINE_QWEN:
+        if is_qwen_engine(engine):
             options = qwen_options or {}
+            engine = normalize_qwen_engine(engine)
             return self.qwen.synthesize(
                 text,
                 voice,
                 speed,
                 str(options.get("mode", QWEN_MODE_CUSTOM)),
+                qwen_model_size(engine),
+                str(options.get("backend", GPU_BACKEND_AUTO)),
                 str(options.get("reference_audio", "")),
                 str(options.get("reference_text", "")),
                 str(options.get("instruct", "")),
@@ -379,9 +491,55 @@ try {
 def voice_options(engine: str) -> tuple[str, ...]:
     if engine == ENGINE_EDGE:
         return EDGE_VOICES
-    if engine == ENGINE_QWEN:
+    if is_qwen_engine(engine):
         return QWEN_VOICES
     return ("default",)
+
+
+PLAIN_TEXT_EXTENSIONS = {".txt", ".md", ".log"}
+
+
+def _read_plain_text_lines(path: Path) -> list[str]:
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        content = path.read_text(encoding="gb18030")
+    # Imported text is already prepared by the user. Preserve each non-empty
+    # line as-is instead of applying story-specific normalization.
+    return [line for line in content.splitlines() if line.strip()]
+
+
+def _load_generation_source(path: Path) -> tuple[dict, list[dict]]:
+    if path.suffix.lower() in PLAIN_TEXT_EXTENSIONS:
+        raw_lines = _read_plain_text_lines(path)
+        segment = {
+            "event_id": "custom_text",
+            "event_name": "自定义文本",
+            "story_name": path.stem,
+            "story_code": path.stem,
+            "story_txt": path.stem,
+        }
+        lines = [
+            {
+                "line_id": f"custom_{index:04d}",
+                "speaker": "",
+                "text": line,
+                "match_text": line,
+                "should_speak": True,
+            }
+            for index, line in enumerate(raw_lines, start=1)
+        ]
+        return segment, lines
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    segment = payload.get("segment") or {}
+    source_lines = payload.get("lines") or []
+    lines = [
+        line for line in source_lines
+        if line.get("should_speak", str(line.get("prop", "")).lower() != "name")
+        and str(line.get("text", "")).strip()
+    ]
+    return segment, lines
 
 
 def _legacy_generate_voice_pack(
@@ -397,14 +555,7 @@ def _legacy_generate_voice_pack(
     qwen_options: dict[str, str] | None = None,
     line_instructions: dict[str, str] | None = None,
 ) -> Path:
-    payload = json.loads(story_path.read_text(encoding="utf-8"))
-    segment = payload.get("segment") or {}
-    source_lines = payload.get("lines") or []
-    lines = [
-        line for line in source_lines
-        if line.get("should_speak", str(line.get("prop", "")).lower() != "name")
-        and str(line.get("text", "")).strip()
-    ]
+    segment, lines = _load_generation_source(story_path)
     if not lines:
         raise RuntimeError("该剧情文件没有可生成的对白行")
 
@@ -413,7 +564,7 @@ def _legacy_generate_voice_pack(
     qwen_options = qwen_options or {}
     line_instructions = line_instructions or {}
     qwen_mode = str(qwen_options.get("mode", QWEN_MODE_CUSTOM))
-    if engine == ENGINE_QWEN:
+    if is_qwen_engine(engine):
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(qwen_mode) / _safe_part(voice)
     else:
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(voice)
@@ -452,7 +603,7 @@ def _legacy_generate_voice_pack(
                 "text": text,
                 "match_text": line.get("match_text", text),
                 "audio": output.name,
-                "tts_instruct": line_options.get("instruct", "") if engine == ENGINE_QWEN else "",
+                "tts_instruct": line_options.get("instruct", "") if is_qwen_engine(engine) else "",
             }
         )
         progress(index, total, f"已完成 {index}/{total}")
@@ -463,11 +614,13 @@ def _legacy_generate_voice_pack(
         "voice": voice,
         "speed": round(float(speed), 1),
         "qwen": {
+            "model_size": qwen_model_size(engine),
+            "backend": str(qwen_options.get("backend", GPU_BACKEND_AUTO)),
             "mode": qwen_mode,
             "reference_audio": str(qwen_options.get("reference_audio", "")),
             "reference_text": str(qwen_options.get("reference_text", "")),
             "instruct": str(qwen_options.get("instruct", "")),
-        } if engine == ENGINE_QWEN else None,
+        } if is_qwen_engine(engine) else None,
         "source_story": str(story_path),
         "segment": segment,
         "lines": entries,
@@ -491,14 +644,7 @@ def generate_voice_pack(
     line_instructions: dict[str, str] | None = None,
 ) -> Path:
     """Generate a pack while persisting per-line status for resume and retry."""
-    payload = json.loads(story_path.read_text(encoding="utf-8"))
-    segment = payload.get("segment") or {}
-    source_lines = payload.get("lines") or []
-    lines = [
-        line for line in source_lines
-        if line.get("should_speak", str(line.get("prop", "")).lower() != "name")
-        and str(line.get("text", "")).strip()
-    ]
+    segment, lines = _load_generation_source(story_path)
     if not lines:
         raise RuntimeError("story has no speakable lines")
 
@@ -507,7 +653,7 @@ def generate_voice_pack(
     qwen_mode = str(qwen_options.get("mode", QWEN_MODE_CUSTOM))
     event_id = _safe_part(segment.get("event_id", story_path.parent.name))
     story_id = _safe_part(segment.get("story_txt", story_path.stem))
-    if engine == ENGINE_QWEN:
+    if is_qwen_engine(engine):
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(qwen_mode) / _safe_part(voice)
     else:
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(voice)
@@ -549,11 +695,13 @@ def generate_voice_pack(
         "voice": voice,
         "speed": round(float(speed), 1),
         "qwen": {
+            "model_size": qwen_model_size(engine),
+            "backend": str(qwen_options.get("backend", GPU_BACKEND_AUTO)),
             "mode": qwen_mode,
             "reference_audio": str(qwen_options.get("reference_audio", "")),
             "reference_text": str(qwen_options.get("reference_text", "")),
             "instruct": str(qwen_options.get("instruct", "")),
-        } if engine == ENGINE_QWEN else None,
+        } if is_qwen_engine(engine) else None,
         "source_story": str(story_path),
         "segment": segment,
         "lines": entries,
@@ -612,13 +760,13 @@ def generate_voice_pack(
                 raise GenerationInterrupted(manifest_path) from exc
             entry["status"] = "failed"
             entry["error"] = str(exc)[:1000]
-            entry["tts_instruct"] = line_options.get("instruct", "") if engine == ENGINE_QWEN else ""
+            entry["tts_instruct"] = line_options.get("instruct", "") if is_qwen_engine(engine) else ""
             save_state()
             progress(index, total, f"failed {index}/{total}: {text[:24]}")
             continue
         entry["status"] = "completed"
         entry["audio"] = output.name
-        entry["tts_instruct"] = line_options.get("instruct", "") if engine == ENGINE_QWEN else ""
+        entry["tts_instruct"] = line_options.get("instruct", "") if is_qwen_engine(engine) else ""
         save_state()
         progress(index, total, f"completed {index}/{total}")
 

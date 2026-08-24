@@ -10,9 +10,10 @@ from pathlib import Path
 
 
 class QwenRuntime:
-    def __init__(self, model_dir: Path, tokenizer_dir: Path | None) -> None:
+    def __init__(self, model_dir: Path, tokenizer_dir: Path | None, backend: str) -> None:
         self.model_dir = model_dir
         self.tokenizer_dir = tokenizer_dir
+        self.backend = backend
         self.model = None
         self._clone_prompt_key = None
         self._clone_prompt = None
@@ -27,8 +28,13 @@ class QwenRuntime:
             import torch
             from qwen_tts import Qwen3TTSModel
 
-            if torch.cuda.is_available():
+            if self.backend in {"cuda", "rocm"}:
+                if not torch.cuda.is_available():
+                    raise RuntimeError(f"{self.backend.upper()} 后端未检测到可用 GPU")
                 device_map = "cuda:0"
+                # Qwen's reference setup uses BF16. Ampere RTX 30-series cards
+                # support it, and it avoids the CUDA kernel assert seen with
+                # FP16 in the tokenizer path while keeping 0.6B practical on 6GB.
                 dtype = torch.bfloat16
             else:
                 device_map = "cpu"
@@ -41,7 +47,9 @@ class QwenRuntime:
                 str(self.model_dir),
                 device_map=device_map,
                 dtype=dtype,
-                attn_implementation="sdpa",
+                # Eager attention is slower but avoids a CUDA SDPA path that
+                # can trip invalid-token assertions on some 6GB Ampere setups.
+                attn_implementation="eager" if self.backend == "cuda" else "sdpa",
             )
             return self.model
 
@@ -182,9 +190,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=47831)
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--tokenizer-dir", type=Path)
+    parser.add_argument("--backend", choices=("cuda", "rocm", "cpu"), default="rocm")
     args = parser.parse_args()
 
-    runtime = QwenRuntime(args.model_dir, args.tokenizer_dir)
+    runtime = QwenRuntime(args.model_dir, args.tokenizer_dir, args.backend)
 
     class RuntimeHandler(Handler):
         pass

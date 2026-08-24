@@ -1,6 +1,9 @@
 # Core online and local Windows TTS options.
 edge-tts>=7.0.0
 
+# Modern Qt desktop interface.
+PySide6>=6.7,<7
+
 # OCR, screen capture image handling and audio playback.
 Pillow>=10.0.0
 rapidocr_onnxruntime>=1.4.4

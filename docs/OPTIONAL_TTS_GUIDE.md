@@ -24,7 +24,7 @@
 
 ## 推荐架构：GUI 与大模型进程分离
 
-不要在 Tkinter GUI 进程里直接导入 PyTorch、Transformers 或大型 TTS 模型。推荐使用独立服务进程：
+不要在 PySide6 GUI 进程里直接导入 PyTorch、Transformers 或大型 TTS 模型。推荐使用独立服务进程：
 
 ```text
 GUI
@@ -103,9 +103,15 @@ runtime/models/<model-name>/
 ### NVIDIA / CUDA
 
 - 换用 CUDA 对应的 PyTorch 和依赖版本；
+- 应用目录使用独立的 `runtime_cuda`，避免和 ROCm 的 PyTorch 包互相覆盖；
 - 检查 `CUDA_VISIBLE_DEVICES` 和 device map；
 - 用 `torch.cuda.empty_cache()`、进程退出和必要的 IPC 清理释放显存；
 - 不要假设 ROCm 的缓存目录或内核缓存能直接复用。
+
+当前语音生成界面提供 `Qwen3-TTS 0.6B` 和 `Qwen3-TTS 1.7B` 两个模型选项，以及
+`自动检测`、`NVIDIA CUDA`、`AMD ROCm` 三个后端选项。加入队列时会把自动检测结果
+写入任务配置，恢复任务时不会因为机器环境变化而偷偷切换后端。6GB 显存（例如
+RTX 3060 Laptop）应优先使用 0.6B；1.7B 需要根据显存和精度实际测试。
 
 ### macOS / Apple Silicon
 

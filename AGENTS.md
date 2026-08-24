@@ -1,6 +1,6 @@
 # 给开发者和 Agent 的项目说明
 
-这是一个以 Windows + AMD/ROCm 为主要验证环境的 Python/Tkinter 项目。项目由 AI 生成和维护，当前基础功能已经可以使用；修改时应优先保持现有功能稳定，再进行局部改动。
+这是一个以 Windows + AMD/ROCm 为主要验证环境的 Python/PySide6 项目。项目由 AI 生成和维护，当前基础功能已经可以使用；修改时应优先保持现有功能稳定，再进行局部改动。
 
 ## 重要边界
 
@@ -12,7 +12,17 @@
 
 ## 模块职责
 
-- `main.py`：Tkinter 界面、模块导航、队列和用户操作；
+- `main.py`：兼容入口，调用 Qt 应用壳；
+- `qt_main.py`：PySide6 应用壳、模块注册、全局朗读监听生命周期和主题；
+- `app_runtime.py`：便携目录定位、DPI 初始化和设置读写；
+- `ui_config.py`：应用标题和界面个性化配置常量；
+- `qt_base.py`：共享面板基类、工作区通用布局和滚动区域；
+- `qt_story.py`：剧情下载面板和下载队列操作；
+- `qt_voice.py`：语音生成面板和语音生成队列操作；
+- `qt_voice_packs.py`：语音包和本地资源管理面板；
+- `qt_reader.py`：朗读监听状态和当前语音包选择面板；
+- `qt_settings.py`：OCR、DeepSeek 和界面个性化设置面板；
+- `voice_queue.py`：语音生成队列的持久化、路径恢复和状态兼容；
 - `prts_catalog.py`：PRTS Wiki 目录、页面获取和任务控制；
 - `story_catalog.py`：剧情文本规范化、角色名过滤和匹配文本；
 - `voice_generation.py`：TTS 后端、预生成语音包、逐句状态和断点复用；
@@ -35,7 +45,7 @@
 在安装基础依赖后，可以先运行：
 
 ```powershell
-python -m py_compile main.py prts_catalog.py quality_analysis.py reader_engine.py story_catalog.py voice_generation.py
+python -m py_compile main.py qt_main.py qt_base.py qt_story.py qt_voice.py qt_voice_packs.py qt_reader.py qt_settings.py prts_catalog.py quality_analysis.py reader_engine.py story_catalog.py voice_generation.py voice_queue.py
 python main.py --check
 ```
 

@@ -21,6 +21,7 @@ DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODELS_ENDPOINT = "https://api.deepseek.com/models"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 ANALYSIS_VERSION = 2
+PLAIN_TEXT_EXTENSIONS = {".txt", ".md", ".log"}
 
 
 def fetch_deepseek_models(api_key: str) -> tuple[str, ...]:
@@ -62,6 +63,23 @@ def _source_lines(payload: dict) -> list[dict]:
         if line.get("should_speak", str(line.get("prop", "")).lower() != "name")
         and str(line.get("text", "")).strip()
     ]
+
+
+def _load_source_lines(story_path: Path) -> tuple[list[dict], str]:
+    if story_path.suffix.lower() in PLAIN_TEXT_EXTENSIONS:
+        try:
+            content = story_path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            content = story_path.read_text(encoding="gb18030")
+        lines = [line for line in content.splitlines() if line.strip()]
+        return [
+            {"line_id": f"custom_{index:04d}", "speaker": "", "text": line}
+            for index, line in enumerate(lines, start=1)
+        ], story_path.stem
+
+    payload = json.loads(story_path.read_text(encoding="utf-8"))
+    context = (payload.get("segment") or {}).get("story_name") or story_path.stem
+    return _source_lines(payload), context
 
 
 def _fingerprint(lines: list[dict]) -> str:
@@ -190,8 +208,7 @@ def load_or_create_analysis(
     if not api_key.strip():
         raise RuntimeError("已勾选质量优化，但设置中没有填写 DeepSeek API Key")
     model = model.strip() or DEFAULT_DEEPSEEK_MODEL
-    payload = json.loads(story_path.read_text(encoding="utf-8"))
-    lines = _source_lines(payload)
+    lines, context = _load_source_lines(story_path)
     fingerprint = _fingerprint(lines)
     cache_path = analysis_cache_path(story_path, cache_root)
     try:
@@ -209,7 +226,6 @@ def load_or_create_analysis(
     except (OSError, ValueError):
         pass
 
-    context = (payload.get("segment") or {}).get("story_name") or story_path.stem
     merged: dict[str, str] = {}
     batch_size = 24
     for offset in range(0, len(lines), batch_size):
