@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
@@ -48,7 +48,7 @@ class BasePanel(QScrollArea):
 
     def add_header(self, title: str, description: str) -> None:
         header = QWidget()
-        header_layout = QVBoxLayout(header)
+        header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 4)
         header_layout.setSpacing(5)
         title_label = QLabel(title)
@@ -56,9 +56,22 @@ class BasePanel(QScrollArea):
         desc_label = QLabel(description)
         desc_label.setObjectName("pageDescription")
         desc_label.setWordWrap(True)
-        header_layout.addWidget(title_label)
-        header_layout.addWidget(desc_label)
+        text_layout = QVBoxLayout()
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(desc_label)
+        header_layout.addLayout(text_layout, 1)
+        self.header_image = QLabel()
+        self.header_image.setFixedSize(96, 72)
+        self.header_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.header_image.hide()
+        header_layout.addWidget(self.header_image)
         self.layout.addWidget(header)
+
+    def refresh_customization(self) -> None:
+        path = self.app.custom_image_path(f"workspace_{self.module_key}")
+        pixmap = QPixmap(str(path)) if path else QPixmap()
+        self.header_image.setPixmap(pixmap.scaled(96, 72, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation) if not pixmap.isNull() else pixmap)
+        self.header_image.setVisible(not pixmap.isNull())
 
     def card(self, title: str | None = None, note: str | None = None) -> tuple[QFrame, QVBoxLayout]:
         frame = QFrame()

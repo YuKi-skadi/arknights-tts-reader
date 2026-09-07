@@ -1,4 +1,5 @@
-APP_TITLE = "明日方舟剧情阅读器"
+APP_VERSION = "0.8"
+APP_TITLE = f"明日方舟剧情阅读器 ver{APP_VERSION}"
 
 
 CUSTOMIZATION_SLOTS = {
@@ -9,5 +10,4 @@ CUSTOMIZATION_SLOTS = {
     "workspace_reader": ("朗读监听标题图", (96, 72)),
 }
 CUSTOMIZATION_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-
 

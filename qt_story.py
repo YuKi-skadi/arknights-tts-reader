@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QListWidget, QPlainTextEdit, QProgressBar, QPushButton
 
-from app_runtime import project_dir
+from app_runtime import project_dir, atomic_json_save, read_json_object
 from prts_catalog import PRTSStoryClient, PRTSTaskCancelled
 from story_catalog import StorySegment
 from qt_base import BasePanel
@@ -38,6 +38,10 @@ class ConnectedStoryDownloadPanel(BasePanel):
         self.event_by_label: dict[str, dict] = {}
         self.segment_items: list[StorySegment] = []
         self.queue_items: list[dict] = []
+        self.queue_path = project_dir() / "data" / "story_download_queue.json"
+        self.queue_lock = threading.RLock()
+        self.shutting_down = False
+        self._load_queue_state()
         self.queue_thread: threading.Thread | None = None
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
@@ -45,6 +49,38 @@ class ConnectedStoryDownloadPanel(BasePanel):
         super().__init__(app, "剧情下载", "从 PRTS 剧情目录选择主题曲、别传或故事集，再加入下载队列。")
         self.build()
         self._connect_signals()
+        self._refresh_queue_view()
+
+    def _load_queue_state(self) -> None:
+        for path in (self.queue_path, self.queue_path.with_name(self.queue_path.name + ".bak")):
+            try:
+                payload = read_json_object(path)
+                items = []
+                for raw in payload["items"]:
+                    item = dict(raw)
+                    item["segment"] = StorySegment(**item["segment"])
+                    if item.get("status") in {"下载中", "已暂停"}:
+                        item["status"] = "待处理"
+                    items.append(item)
+                self.queue_items = items
+                break
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+
+    def save_queue_state(self) -> None:
+        with self.queue_lock:
+            try:
+                atomic_json_save(self.queue_path, {"version": 1, "items": [
+                    {**item, "segment": item["segment"].to_dict()} for item in self.queue_items]}, backup=True)
+            except (OSError, ValueError) as exc:
+                self.stop_event.set()
+                self.signals.log.emit(f"下载队列保存失败：{exc}")
+
+    def request_shutdown(self) -> None:
+        self.shutting_down = True
+        self.stop_event.set()
+        self.pause_event.clear()
+        self.save_queue_state()
 
     def _connect_signals(self) -> None:
         self.signals.progress.connect(self._update_progress)
@@ -123,7 +159,7 @@ class ConnectedStoryDownloadPanel(BasePanel):
         edit.addStretch(1)
         self.queue_start_button = self.make_button("开始队列", primary=True)
         self.queue_pause_button = QPushButton("暂停")
-        self.queue_stop_button = QPushButton("停止当前")
+        self.queue_stop_button = QPushButton("停止队列")
         self.queue_pause_button.setEnabled(False)
         self.queue_stop_button.setEnabled(False)
         self.queue_start_button.clicked.connect(self.start_queue)
@@ -267,10 +303,11 @@ class ConnectedStoryDownloadPanel(BasePanel):
             added += 1
         self._refresh_queue_view()
         self.set_status(f"已加入下载队列 {added} 项")
+        self.save_queue_state()
 
     def move_queue_item(self, direction: int) -> None:
         selected = self.queue_list.currentRow()
-        if selected < 0 or self.current_queue_index is not None:
+        if selected < 0 or self.queue_thread is not None:
             return
         target = selected + direction
         if not 0 <= target < len(self.queue_items):
@@ -278,12 +315,14 @@ class ConnectedStoryDownloadPanel(BasePanel):
         self.queue_items[selected], self.queue_items[target] = self.queue_items[target], self.queue_items[selected]
         self._refresh_queue_view()
         self.queue_list.setCurrentRow(target)
+        self.save_queue_state()
 
     def remove_queue_item(self) -> None:
         selected = self.queue_list.currentRow()
-        if selected < 0 or self.current_queue_index is not None:
+        if selected < 0 or self.queue_thread is not None:
             return
         self.queue_items.pop(selected)
+        self.save_queue_state()
         self._refresh_queue_view()
 
     def _next_queue_index(self) -> int | None:
@@ -293,9 +332,14 @@ class ConnectedStoryDownloadPanel(BasePanel):
         return None
 
     def start_queue(self) -> None:
+        if self.shutting_down:
+            return
         if self.queue_thread is not None and self.queue_thread.is_alive():
             self.set_status("下载队列正在运行，暂停后请点击“继续”")
             return
+        for item in self.queue_items:
+            if item.get("status") in {"已停止", "失败"}:
+                item["status"] = "待处理"
         if self._next_queue_index() is None:
             self.set_status("下载队列中没有待处理任务")
             return
@@ -313,12 +357,16 @@ class ConnectedStoryDownloadPanel(BasePanel):
             return
         if self.pause_event.is_set():
             self.pause_event.clear()
+            self.queue_items[self.current_queue_index]["status"] = "下载中"
             self.queue_pause_button.setText("暂停")
             self._append_log("已继续当前下载任务。")
         else:
             self.pause_event.set()
+            self.queue_items[self.current_queue_index]["status"] = "已暂停"
             self.queue_pause_button.setText("继续")
             self._append_log("已暂停当前下载任务。")
+        self.save_queue_state()
+        self._refresh_queue_view()
 
     def stop_current(self) -> None:
         if self.current_queue_index is None:
@@ -329,6 +377,9 @@ class ConnectedStoryDownloadPanel(BasePanel):
 
     def _queue_worker(self) -> None:
         while True:
+            if self.shutting_down or self.stop_event.is_set():
+                self.signals.finished.emit()
+                return
             index = self._next_queue_index()
             if index is None:
                 self.signals.finished.emit()
@@ -337,6 +388,7 @@ class ConnectedStoryDownloadPanel(BasePanel):
             item = self.queue_items[index]
             segment = item["segment"]
             item["status"] = "下载中"
+            self.save_queue_state()
             self.client.set_task_controls(self.pause_event, self.stop_event)
             self.signals.queue_update.emit()
             self.signals.log.emit(f"开始下载：{segment.event_name} / {segment.story_code or segment.story_txt}")
@@ -346,7 +398,7 @@ class ConnectedStoryDownloadPanel(BasePanel):
                 folder = project_dir() / "data" / "stories" / self.client._safe_name(category_name) / self.client._safe_name(segment.event_name, segment.event_id)
                 folder.mkdir(parents=True, exist_ok=True)
                 output = folder / f"{self.client._safe_name(segment.story_code or segment.story_name or segment.story_id)}.json"
-                output.write_text(json.dumps(document.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+                atomic_json_save(output, document.to_dict())
                 item["status"] = "已完成"
                 self.signals.log.emit(f"下载完成：{output}")
             except PRTSTaskCancelled:
@@ -356,9 +408,9 @@ class ConnectedStoryDownloadPanel(BasePanel):
                 item["status"] = "失败"
                 self.signals.log.emit(f"下载失败：{exc}")
             finally:
-                self.stop_event.clear()
                 self.pause_event.clear()
                 self.current_queue_index = None
+                self.save_queue_state()
                 self.signals.queue_update.emit()
 
     def _queue_finished(self) -> None:
@@ -372,5 +424,6 @@ class ConnectedStoryDownloadPanel(BasePanel):
         self.refresh_button.setEnabled(True)
         self.current_queue_index = None
         self._refresh_queue_view()
-        self.download_status.setText("下载队列已完成")
-        self.set_status("下载队列已完成")
+        message = "下载队列已完成" if all(item.get("status") == "已完成" for item in self.queue_items) else "下载队列已停止或有失败任务，可点击开始继续"
+        self.download_status.setText(message)
+        self.set_status(message)

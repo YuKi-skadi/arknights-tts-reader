@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+import hashlib
+import logging
+from copy import deepcopy
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtCore import QObject, Signal, Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,6 +25,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QWidget,
+    QPlainTextEdit,
+    QDialog,
+    QVBoxLayout,
 )
 
 from app_runtime import project_dir
@@ -51,7 +57,7 @@ from voice_generation import (
     resolve_gpu_backend,
     voice_options,
 )
-from voice_queue import VoiceQueueStore
+from voice_queue import VoiceQueueStore, manifest_progress, restore_path
 
 
 class VoiceSignals(QObject):
@@ -75,10 +81,13 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.queue_items, saved_queue_config = self.queue_store.load()
         self.visible_queue_indices: list[int] = []
         self.queue_thread: threading.Thread | None = None
+        self.release_thread: threading.Thread | None = None
         self.cancelled = threading.Event()
         self.pause_event = threading.Event()
         self.current_queue_index: int | None = None
         self.user_stopped = False
+        self.shutting_down = False
+        self.queue_save_error = ""
         self.queue_config: dict[str, object] = {
             "engine": ENGINE_EDGE,
             "voice": voice_options(ENGINE_EDGE)[0],
@@ -94,6 +103,8 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.signals.refresh.connect(self._refresh_queue_view)
         self.signals.finished.connect(self._queue_finished)
         self.signals.manifest.connect(lambda path: self.progress_text.setText(f"生成完成：{path}"))
+        if self.queue_store.load_warning:
+            QTimer.singleShot(0, lambda: self.warning("队列恢复提示", self.queue_store.load_warning))
 
     def build(self) -> None:
         options, layout = self.card("生成设置", "6GB 显存建议选择 Qwen3-TTS 0.6B")
@@ -203,6 +214,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.progress.setRange(0, 100)
         self.progress_text = QLabel("等待任务")
         self.progress_text.setObjectName("pageDescription")
+        self.progress_text.setWordWrap(True)
         progress_layout.addWidget(self.progress)
         progress_layout.addWidget(self.progress_text)
         self.add_card(progress_card)
@@ -215,11 +227,14 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         queue_head.addWidget(QLabel("任务筛选"))
         queue_head.addWidget(self.queue_filter)
         queue_head.addStretch(1)
-        queue_head.addWidget(QLabel("每项锁定生成方式；本轮失败不会自动重试"))
+        recover = QPushButton("恢复历史任务")
+        recover.clicked.connect(self.recover_history)
+        queue_head.addWidget(recover)
         queue_layout.addLayout(queue_head)
         self.queue_list = QListWidget()
         self.queue_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.queue_list.setMinimumHeight(170)
+        self.queue_list.itemSelectionChanged.connect(self._show_selected_progress)
         queue_layout.addWidget(self.queue_list)
         self.queue_status = QLabel("队列为空")
         self.queue_status.setObjectName("pageDescription")
@@ -237,9 +252,9 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         actions.addStretch(1)
         inspect = QPushButton("查看日志 / 重试失败")
         inspect.clicked.connect(self.inspect_generation_result)
-        self.queue_start_button = self.make_button("开始队列", primary=True)
+        self.queue_start_button = self.make_button("开始 / 继续队列", primary=True)
         self.queue_pause_button = QPushButton("暂停")
-        self.queue_stop_button = QPushButton("停止当前")
+        self.queue_stop_button = QPushButton("停止队列（保留进度）")
         self.queue_start_button.clicked.connect(self.start_queue)
         self.queue_pause_button.clicked.connect(self.toggle_pause)
         self.queue_stop_button.clicked.connect(self.stop_current)
@@ -399,26 +414,48 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self._add_paths_to_queue(paths, "关卡")
 
     def _add_paths_to_queue(self, paths: list[Path], source_label: str) -> None:
-        existing = {str(item["path"]) for item in self.queue_items}
         config = self._current_generation_config()
+        options = config.get("qwen_options") or {}
+        if is_qwen_engine(str(config["engine"])) and options.get("mode") == QWEN_MODE_CLONE:
+            try:
+                options["reference_audio"] = self._keep_reference(options.get("reference_audio", ""))
+            except (OSError, ValueError) as exc:
+                self.warning("参考音频不可用", str(exc))
+                return
         added = 0
         for path in paths:
-            if str(path) in existing:
+            if any(Path(item["path"]) == path and item.get("generation_config") == config for item in self.queue_items):
                 continue
-            self.queue_items.append({"path": path, "status": "待处理", "generation_config": dict(config)})
-            existing.add(str(path))
+            self.queue_items.append({"path": path, "status": "待处理", "generation_config": deepcopy(config)})
             added += 1
         self.queue_config = dict(config)
         self._save_queue_state()
         self._refresh_queue_view()
         self.set_status(f"已加入语音生成队列 {added} 项（{source_label}）")
 
+    @staticmethod
+    def _keep_reference(value: str) -> str:
+        source = restore_path(value)
+        if not value or not source.is_file():
+            raise ValueError("请选择声音克隆参考音频；加入队列时会复制到便携目录。")
+        with source.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        root = project_dir() / "data" / "reference_audio"
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / (digest[:24] + source.suffix.lower())
+        if not target.exists():
+            shutil.copy2(source, target)
+        return str(target)
+
     def _current_generation_config(self) -> dict[str, object]:
         engine = self._selected_engine()
         options = {"mode": str(self.qwen_mode_box.currentData() or QWEN_MODE_CUSTOM), "reference_audio": self.reference_audio.text().strip(), "reference_text": self.reference_text.text().strip()}
         if is_qwen_engine(engine):
             options["backend"] = resolve_gpu_backend(self._selected_gpu_backend())
-        return {"engine": engine, "voice": self.voice.currentText() or voice_options(engine)[0], "speed": self.generation_speed.value(), "qwen_options": options, "optimize_quality": self.optimize_quality.isChecked()}
+        config = {"engine": engine, "voice": self.voice.currentText() or voice_options(engine)[0], "speed": self.generation_speed.value(), "qwen_options": options, "optimize_quality": self.optimize_quality.isChecked()}
+        if config["optimize_quality"]:
+            config["deepseek_model"] = str(self.app.settings.get("deepseek_model", DEFAULT_DEEPSEEK_MODEL))
+        return config
 
     def _task_generation_config(self, item: dict) -> dict[str, object]:
         config = item.get("generation_config")
@@ -454,6 +491,8 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             if index >= 0:
                 self.gpu_backend.setCurrentIndex(index)
         self.optimize_quality.setChecked(bool(config.get("optimize_quality", False)))
+        if self.voice.findText(voice) >= 0:
+            self.voice.setCurrentText(voice)
         self._update_qwen_controls()
 
     def _apply_saved_queue_config(self) -> None:
@@ -474,13 +513,21 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         path = Path(item["path"])
         source = f"自定义文本 / {path.stem}" if path.parent.name == "custom_texts" else f"{path.parent.parent.name} / {path.stem}"
         missing = "（文件不存在）" if not path.exists() else ""
-        return f"[{item.get('status', '待处理')}] {source} · {self._generation_config_label(self._task_generation_config(item))}{missing}"
+        progress = f" · 已完成 {item.get('done', 0)}/{item.get('total', '?')} 句"
+        next_line = f" · 下次从第 {item['next_line']} 句继续" if item.get("next_line") else ""
+        return f"[{item.get('status', '待处理')}] {source}{progress}{next_line}\n{self._generation_config_label(self._task_generation_config(item))}{missing}"
 
-    def _save_queue_state(self) -> None:
+    def _save_queue_state(self) -> bool:
         try:
             self.queue_store.save(self.queue_items, self.queue_config)
+            self.queue_save_error = ""
+            return True
         except (OSError, TypeError, ValueError) as exc:
-            self.set_status(f"生成队列保存失败：{exc}")
+            self.queue_save_error = f"生成队列保存失败：{exc}。请检查磁盘空间和文件夹写入权限。"
+            logging.exception("Queue checkpoint failed")
+            self._backend_status(self.queue_save_error)
+            self.cancelled.set()
+            return False
 
     def save_queue_state(self) -> None:
         self._save_queue_state()
@@ -504,18 +551,23 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         selected = self._selected_queue_index()
         queue_filter = self.queue_filter.currentText()
         self.visible_queue_indices = [index for index, item in enumerate(self.queue_items) if self._queue_filter_matches(str(item.get("status", "待处理")), queue_filter)]
+        self.queue_list.blockSignals(True)
         self.queue_list.clear()
         for index in self.visible_queue_indices:
             self.queue_list.addItem(self._queue_label(self.queue_items[index]))
         restore = self.current_queue_index if self.current_queue_index in self.visible_queue_indices else selected
         if restore in self.visible_queue_indices:
             self.queue_list.setCurrentRow(self.visible_queue_indices.index(restore))
+        elif self.visible_queue_indices:
+            self.queue_list.setCurrentRow(0)
+        self.queue_list.blockSignals(False)
+        self._show_selected_progress()
         pending = sum(item.get("status") != "已完成" for item in self.queue_items)
         completed = len(self.queue_items) - pending
         self.queue_status.setText(f"筛选：{queue_filter} · 当前 {len(self.visible_queue_indices)} 项 · 未完成 {pending} 项 · 已完成 {completed} 项")
 
     def move_queue_item(self, direction: int) -> None:
-        if self.queue_filter.currentText() == "已完成" or self.current_queue_index is not None:
+        if self.queue_filter.currentText() == "已完成" or self.queue_thread is not None:
             return
         index = self._selected_queue_index()
         if index is None:
@@ -531,7 +583,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.queue_list.setCurrentRow(target_position)
 
     def remove_queue_item(self) -> None:
-        if self.current_queue_index is not None:
+        if self.queue_thread is not None:
             return
         index = self._selected_queue_index()
         if index is None:
@@ -548,6 +600,11 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         return None
 
     def start_queue(self) -> None:
+        if self.shutting_down:
+            return
+        if self.release_thread is not None and self.release_thread.is_alive():
+            self.set_status("Qwen 服务仍在释放中，请稍后开始队列")
+            return
         if self.queue_thread is not None and self.queue_thread.is_alive():
             self.set_status("当前队列正在运行；暂停后请点击“继续”")
             return
@@ -564,7 +621,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             if not reference or not Path(reference).is_file():
                 replacement = self.reference_audio.text().strip()
                 if replacement and Path(replacement).is_file():
-                    options["reference_audio"] = replacement
+                    options["reference_audio"] = self._keep_reference(replacement)
                     config["qwen_options"] = options
                 else:
                     self.warning("缺少参考音频", "当前任务原先使用的参考音频已找不到，请重新选择后再继续。")
@@ -576,7 +633,9 @@ class ConnectedVoiceGenerationPanel(BasePanel):
                 return
         self.queue_config = dict(config)
         self._apply_generation_config(config)
-        self._save_queue_state()
+        if not self._save_queue_state():
+            self.warning("无法保存队列", self.queue_save_error)
+            return
         self.cancelled.clear()
         self.pause_event.clear()
         self.user_stopped = False
@@ -591,24 +650,38 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             return
         if self.pause_event.is_set():
             self.pause_event.clear()
+            self.queue_items[self.current_queue_index]["status"] = "生成中"
             self.queue_pause_button.setText("暂停")
             self.set_status("已继续当前语音生成任务")
         else:
             self.pause_event.set()
+            self.queue_items[self.current_queue_index]["status"] = "已暂停"
             self.queue_pause_button.setText("继续")
-            self.set_status("已暂停当前语音生成任务")
+            self.set_status("暂停已请求，当前句完成后暂停；断点已保存")
+        self._save_queue_state()
+        self._refresh_queue_view()
 
     def stop_current(self) -> None:
-        if self.current_queue_index is None:
+        if self.queue_thread is None:
             return
         self.user_stopped = True
         self.cancelled.set()
         self.pause_event.clear()
         self.set_status("正在停止当前语音生成任务，当前句完成后生效")
 
+    def request_shutdown(self) -> None:
+        self.shutting_down = True
+        self.user_stopped = True
+        self.cancelled.set()
+        self.pause_event.clear()
+        self._save_queue_state()
+
     def _queue_worker(self) -> None:
         attempted: set[int] = set()
         while True:
+            if self.shutting_down or self.user_stopped or self.cancelled.is_set():
+                self.signals.finished.emit()
+                return
             index = self._next_queue_index(attempted)
             if index is None:
                 self.signals.finished.emit()
@@ -619,7 +692,9 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             item["status"] = "已暂停" if self.pause_event.is_set() else "生成中"
             config = self._task_generation_config(item)
             self.queue_config = dict(config)
-            self._save_queue_state()
+            if not self._save_queue_state():
+                self.signals.finished.emit()
+                return
             self.signals.refresh.emit()
             try:
                 engine = str(config.get("engine", ENGINE_EDGE))
@@ -630,15 +705,20 @@ class ConnectedVoiceGenerationPanel(BasePanel):
                 line_instructions = {}
                 story_path = Path(item["path"])
                 if optimize and is_qwen_engine(engine):
-                    line_instructions = load_or_create_analysis(story_path, project_dir() / "data" / "tts_analysis", str(self.app.settings.get("deepseek_api_key", "")), self._backend_status, model=str(self.app.settings.get("deepseek_model", DEFAULT_DEEPSEEK_MODEL)))
-                manifest = generate_voice_pack(story_path, project_dir() / "data" / "voice_packs", engine, voice, speed, self._generation_progress, self.cancelled, self.backend, self.pause_event, options, line_instructions)
+                    line_instructions = load_or_create_analysis(story_path, project_dir() / "data" / "tts_analysis", str(self.app.settings.get("deepseek_api_key", "")), self._backend_status, model=str(config.get("deepseek_model") or self.app.settings.get("deepseek_model", DEFAULT_DEEPSEEK_MODEL)), cancelled=self.cancelled, paused=self.pause_event)
+                if self.cancelled.is_set():
+                    raise RuntimeError("用户已停止队列")
+                manifest = generate_voice_pack(story_path, project_dir() / "data" / "voice_packs", engine, voice, speed, self._generation_progress, self.cancelled, self.backend, self.pause_event, options, line_instructions,
+                    state_changed=lambda path, payload: self._checkpoint(item, path, payload),
+                    generation_config=config, resume_manifest=item.get("manifest"))
                 item["manifest"] = manifest
                 item["status"] = "已完成"
+                item.pop("last_error", None)
                 self.signals.manifest.emit(str(manifest))
             except GenerationInterrupted as exc:
                 item["status"] = "中断"
                 item["manifest"] = exc.manifest_path
-                self._backend_status("当前语音生成已中断，未安排自动关机")
+                self._backend_status("当前语音生成已中断，完成片段和断点已保存")
             except GenerationPartiallyFailed as exc:
                 item["status"] = "部分完成"
                 item["manifest"] = exc.manifest_path
@@ -648,10 +728,18 @@ class ConnectedVoiceGenerationPanel(BasePanel):
                 item["last_error"] = str(exc)[:1000]
                 self._backend_status(f"语音生成{item['status']}：{exc}")
             finally:
-                self.cancelled.clear()
+                if self.shutting_down and item.get("status") != "已完成":
+                    item["status"] = "中断"
                 self.current_queue_index = None
                 self._save_queue_state()
                 self.signals.refresh.emit()
+
+    def _checkpoint(self, item: dict, path: Path, payload: dict) -> None:
+        item["manifest"] = path
+        item.update(manifest_progress(path, payload))
+        if not self._save_queue_state():
+            raise OSError(self.queue_save_error)
+        self.signals.refresh.emit()
 
     def _queue_finished(self) -> None:
         self.queue_thread = None
@@ -661,6 +749,8 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.queue_stop_button.setEnabled(False)
         self.current_queue_index = None
         self._refresh_queue_view()
+        if self.queue_save_error:
+            self.warning("队列保存失败", self.queue_save_error)
         successful = bool(self.queue_items) and all(item.get("status") == "已完成" for item in self.queue_items)
         if successful:
             self.progress.setValue(100)
@@ -674,6 +764,9 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.signals.progress.emit(done, total, text)
 
     def _progress_ui(self, done: int, total: int, text: str) -> None:
+        index = self.current_queue_index
+        if index is not None:
+            done = int(self.queue_items[index].get("done", 0))
         self.progress.setValue(round(done * 100 / total) if total else 0)
         self.progress_text.setText(text)
         self.set_status(text)
@@ -685,28 +778,73 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.set_status(text)
 
     def release_qwen(self) -> None:
+        if self.queue_thread is not None:
+            self.warning("队列正在运行", "请先停止队列，再释放 Qwen 服务。")
+            return
+        if self.release_thread is not None and self.release_thread.is_alive():
+            return
         self.set_status("正在释放 Qwen3-TTS 服务…")
-        threading.Thread(target=self.backend.release_qwen, daemon=True).start()
+        self.release_thread = threading.Thread(target=self.backend.release_qwen, daemon=True)
+        self.release_thread.start()
 
     def inspect_generation_result(self) -> None:
-        candidates = [item for item in self.queue_items if item.get("status") in {"部分完成", "失败", "中断", "已停止"}]
-        if not candidates:
-            self.info("生成结果", "当前没有可查看的失败或中断任务。")
+        index = self._selected_queue_index()
+        if index is None:
+            self.info("任务详情", "请先选择一个任务。")
             return
-        item = candidates[0]
-        manifest_path = Path(item.get("manifest", "")) if item.get("manifest") else None
-        failed_count = 0
-        if manifest_path and manifest_path.exists():
+        item = self.queue_items[index]
+        lines = [f"任务：{Path(item['path']).stem}", self._queue_label(item),
+                 f"源文件：{item['path']}", f"语音清单：{item.get('manifest', '尚未开始')}",
+                 f"最近错误：{item.get('last_error', '无')}"]
+        if item.get("manifest"):
             try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-                failed_count = sum(entry.get("status") in {"failed", "interrupted"} for entry in payload.get("lines") or [])
-            except (OSError, ValueError):
-                pass
-        if QMessageBox.question(self, "发现未完成片段", f"任务：{Path(item['path']).stem}\n\n未成功片段：{failed_count or '未知'} 个\n\n是否重新加入队列？已完成片段会直接复用。") != QMessageBox.StandardButton.Yes:
+                payload = json.loads(Path(item["manifest"]).read_text(encoding="utf-8"))
+                names = {"completed": "已完成", "failed": "失败", "pending": "待生成", "interrupted": "中断", "generating": "生成中"}
+                for number, entry in enumerate(payload.get("lines") or [], 1):
+                    lines.append(f"\n第 {number} 句 [{names.get(entry.get('status'), '未知')}] {entry.get('text', '')}")
+                    if entry.get("error"):
+                        lines.append(f"错误：{entry['error']}")
+            except (OSError, ValueError, TypeError) as exc:
+                lines.append(f"无法读取清单：{exc}")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("任务进度与逐句记录")
+        dialog.resize(780, 550)
+        layout = QVBoxLayout(dialog)
+        detail = QPlainTextEdit()
+        detail.setReadOnly(True)
+        detail.setPlainText("\n".join(lines))
+        layout.addWidget(detail)
+        retry = QPushButton("重新排队（复用已完成片段）")
+        retry.setEnabled(self.queue_thread is None)
+        def requeue() -> None:
+            item["status"] = "待处理"
+            self._save_queue_state()
+            self._refresh_queue_view()
+            self.set_status("已重新排队；点击“开始 / 继续队列”继续生成")
+            dialog.accept()
+        retry.clicked.connect(requeue)
+        layout.addWidget(retry)
+        close = QPushButton("关闭")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def _show_selected_progress(self) -> None:
+        index = self._selected_queue_index()
+        if index is None:
             return
-        item["status"] = "待处理"
+        item = self.queue_items[index]
+        total, done = int(item.get("total") or 0), int(item.get("done") or 0)
+        self.progress.setValue(round(done * 100 / total) if total else 0)
+        next_line = f" · 下一句：第 {item['next_line']} 句 {str(item.get('current_text', ''))[:100]}" if item.get("next_line") else ""
+        self.progress_text.setText(f"{Path(item['path']).stem}：已完成 {done}/{total or '?'} 句 · 失败 {item.get('failed', 0)} 句{next_line}")
+
+    def recover_history(self) -> None:
+        if self.queue_thread is not None:
+            self.warning("队列正在运行", "请先停止队列，再恢复历史任务。")
+            return
+        added = self.queue_store.recover_manifests(self.queue_items)
         self._save_queue_state()
+        self.queue_filter.setCurrentText("全部")
         self._refresh_queue_view()
-        self.set_status("已将失败片段所在任务重新加入队列")
-        if self.queue_thread is None or not self.queue_thread.is_alive():
-            self.start_queue()
+        self.info("历史任务恢复", f"已恢复 {added} 项。\n已有清单中的完成句数会自动核对；源文本缺失的任务需要先恢复原文件。\n没有留下语音清单的旧任务无法重建。")

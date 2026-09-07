@@ -50,6 +50,28 @@ Qwen3-TTS 是可选功能。模型和 GPU 环境应放在应用目录的 `runtim
 
 ## 4. 修改代码后重新构建
 
+ver0.8 的离线回归测试：
+
+```powershell
+python tests/test_regressions.py
+```
+
+若使用已有的便携 Python 构建，可以传入路径：
+
+```powershell
+.\build_windows.ps1 -PythonPath 'D:\portable\python\python.exe' -OutputDirectory 'D:\release'
+```
+
+生成后的 EXE 可进行两进程离线验收，输出目录必须是专用测试目录。测试只在该目录内建立模拟数据，用真实 Windows SAPI 生成三句测试音频，并验证 OCR：
+
+```powershell
+.\ArknightsTTSReader.exe --self-test-output 'D:\reader-test' --self-test-phase prepare
+# 等待 prepare-report.json 出现且 ok 为 true，再执行：
+.\ArknightsTTSReader.exe --self-test-output 'D:\reader-test' --self-test-phase resume
+```
+
+resume-report.json 应显示 ok 为 true。两步之间可移动整个测试目录，再把新路径传给第二步，以验证便携路径恢复。
+
 修改 Python 文件后，先运行基础检查：
 
 ```powershell

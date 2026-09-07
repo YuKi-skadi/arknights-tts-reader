@@ -138,6 +138,9 @@ class ConnectedVoicePackPanel(BasePanel):
         self.export_button.setEnabled(enabled)
 
     def delete_selected_resources(self) -> None:
+        if any(getattr(panel, "queue_thread", None) is not None for panel in self.app.panel_instances.values()):
+            self.warning("任务正在运行", "请先停止生成或下载队列，再删除资源，避免丢失断点和音频。")
+            return
         indexes = [self.resources_view.row(item) for item in self.resources_view.selectedItems()]
         if not indexes:
             self.set_status("请先选择要删除的资源")
@@ -152,6 +155,8 @@ class ConnectedVoicePackPanel(BasePanel):
         deleted = 0
         for resource in selected:
             target = Path(resource["delete_path"]).resolve()
+            if target == data_root:
+                continue
             try:
                 target.relative_to(data_root)
             except ValueError:
@@ -230,4 +235,3 @@ class ConnectedVoicePackPanel(BasePanel):
                 self.set_status(f"导出语音失败：{exc}")
         detail = f"，跳过 {skipped} 个" if skipped else ""
         self.set_status(f"已按语音名导出 {exported} 个自定义语音包{detail}")
-

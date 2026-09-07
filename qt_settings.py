@@ -50,6 +50,10 @@ class SettingsPanel(BasePanel):
         form.setVerticalSpacing(12)
         self.story_dir = QLineEdit("data\\stories")
         self.voice_cache_dir = QLineEdit("data\\voice_cache")
+        self.story_dir.setReadOnly(True)
+        self.voice_cache_dir.setReadOnly(True)
+        self.story_dir.setToolTip("便携版使用程序目录内的固定路径")
+        self.voice_cache_dir.setToolTip("便携版使用程序目录内的固定路径")
         form.addRow("剧情数据目录", self.story_dir)
         form.addRow("语音缓存目录", self.voice_cache_dir)
 

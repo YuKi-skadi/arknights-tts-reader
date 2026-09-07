@@ -11,10 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+from app_runtime import atomic_json_save
 
 
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
@@ -203,14 +207,16 @@ def load_or_create_analysis(
     api_key: str,
     status: Callable[[str], None] | None = None,
     model: str = DEFAULT_DEEPSEEK_MODEL,
+    cancelled: threading.Event | None = None,
+    paused: threading.Event | None = None,
 ) -> dict[str, str]:
     """Return cached or newly generated line_id -> instruct mappings."""
-    if not api_key.strip():
-        raise RuntimeError("已勾选质量优化，但设置中没有填写 DeepSeek API Key")
     model = model.strip() or DEFAULT_DEEPSEEK_MODEL
     lines, context = _load_source_lines(story_path)
     fingerprint = _fingerprint(lines)
     cache_path = analysis_cache_path(story_path, cache_root)
+    merged: dict[str, str] = {}
+    processed = 0
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if (
@@ -220,33 +226,32 @@ def load_or_create_analysis(
         ):
             result = cached.get("instructions") or {}
             if isinstance(result, dict):
-                if status:
-                    status("已读取缓存的 DeepSeek 情绪分析")
-                return {str(key): str(value) for key, value in result.items()}
+                merged = {str(key): str(value) for key, value in result.items()}
+                processed = max(0, min(len(lines), int(cached.get("processed", len(lines)))))
+                if processed == len(lines):
+                    if status:
+                        status("已读取缓存的 DeepSeek 情绪分析")
+                    return merged
     except (OSError, ValueError):
         pass
 
-    merged: dict[str, str] = {}
+    if not api_key.strip():
+        raise RuntimeError("已勾选质量优化，但设置中没有填写 DeepSeek API Key")
     batch_size = 24
-    for offset in range(0, len(lines), batch_size):
+    for offset in range(processed, len(lines), batch_size):
+        while paused is not None and paused.is_set():
+            if cancelled is not None and cancelled.is_set():
+                raise RuntimeError("情绪分析已中断，已完成批次已保存")
+            time.sleep(0.2)
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("情绪分析已中断，已完成批次已保存")
         batch = lines[offset:offset + batch_size]
         if status:
             status(f"DeepSeek 情绪分析：{min(offset + len(batch), len(lines))}/{len(lines)}")
         merged.update(_request_batch(api_key, batch, str(context), model=model))
+        atomic_json_save(cache_path, {"version": ANALYSIS_VERSION,
+            "source_story": str(story_path), "fingerprint": fingerprint,
+            "model": model, "instructions": merged,
+            "processed": min(offset + len(batch), len(lines))})
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(
-        json.dumps(
-            {
-                "version": ANALYSIS_VERSION,
-                "source_story": str(story_path),
-                "fingerprint": fingerprint,
-                "model": model,
-                "instructions": merged,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
     return merged

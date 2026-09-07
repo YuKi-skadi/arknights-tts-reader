@@ -203,6 +203,8 @@ class ListenerEngine:
                         pass
                     last_debug_save = now
                 text, _score = self._recognize_best(image.convert("RGB"), ocr, ImageOps)
+                if self.stop_event.is_set():
+                    break
                 if text != emitted_text:
                     self._emit("ocr", text)
                     emitted_text = text
@@ -232,7 +234,7 @@ class ListenerEngine:
                                 self._emit("error", f"找不到语音文件：{audio}")
                     else:
                         self._emit("unmatched", "未匹配到当前语音包")
-                time.sleep(self.interval)
+                self.stop_event.wait(self.interval)
         except Exception as exc:
             self._emit("error", str(exc))
         finally:

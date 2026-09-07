@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import hashlib
+import socket
 import os
 import re
 import shutil
@@ -21,6 +23,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+from app_runtime import atomic_json_save, read_json_object
+from voice_queue import portable_path, restore_path
 
 
 ENGINE_EDGE = "edge-tts"
@@ -140,6 +145,10 @@ def speed_to_edge_rate(speed: float) -> str:
 
 def prepare_external_runtime() -> None:
     """Make packages beside a frozen EXE importable without bundling them."""
+    if getattr(sys, "frozen", False):
+        # GUI/OCR dependencies are bundled. Importing packages from the GPU
+        # Python here can mix two incompatible numpy/Qt/ONNX installations.
+        return
     runtime_python = project_dir() / "runtime" / "python"
     standard_library = runtime_python / "Lib"
     site_packages = runtime_python / "Lib" / "site-packages"
@@ -282,15 +291,14 @@ class QwenClient:
         with self.lock:
             process = self.process
             self.process = None
-            # Always call the endpoint, even when this GUI instance lost its
-            # Popen handle after a module was recreated. This also releases a
-            # Qwen server left behind by an older application process.
+            # Only stop the subprocess owned by this client.
             request_sent = False
-            try:
-                self._request("/shutdown", {}, timeout=3)
-                request_sent = True
-            except Exception:
-                pass
+            if process is not None:
+                try:
+                    self._request("/shutdown", {}, timeout=3)
+                    request_sent = True
+                except Exception:
+                    pass
             if process is not None:
                 try:
                     process.wait(timeout=5)
@@ -323,6 +331,11 @@ class QwenClient:
                 f"找不到 {backend.upper()} 的 Qwen3-TTS {model_size} 运行时或对应模型，请检查 runtime_{'cuda' if backend == GPU_BACKEND_CUDA else ''} 和 models 目录。"
             )
         runtime, python, model, tokenizer = located
+        # Each GUI owns its server. Do not connect to (or stop) another app's
+        # service just because the old fixed port is already occupied.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
         script = runtime / "tts_server.py"
         command = [
             str(python), str(script),
@@ -332,15 +345,18 @@ class QwenClient:
         ]
         if tokenizer.is_dir():
             command.extend(["--tokenizer-dir", str(tokenizer)])
-        self.process = subprocess.Popen(
-            command,
-            cwd=str(runtime),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=runtime_environment(project_dir() / "data" / "qwen_cache" / backend, backend),
-        )
+        log_dir = project_dir() / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"qwen-{backend}.log"
+        if log_path.exists() and log_path.stat().st_size > 5_000_000:
+            log_path.replace(log_path.with_suffix(".log.bak"))
+        with log_path.open("ab") as log:
+            self.process = subprocess.Popen(
+                command, cwd=str(runtime), stdin=subprocess.DEVNULL,
+                stdout=log, stderr=log,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=runtime_environment(project_dir() / "data" / "qwen_cache" / backend, backend),
+            )
         self.active_mode = mode
         self.active_model_size = model_size
         self.active_backend = backend
@@ -350,7 +366,7 @@ class QwenClient:
             if self.process.poll() is not None:
                 self.process = None
                 raise RuntimeError(
-                    f"Qwen3-TTS 服务启动失败，请检查 {GPU_BACKEND_LABELS.get(backend, backend)} 运行时、显卡驱动和模型文件"
+                    f"Qwen3-TTS 服务启动失败，请检查运行时、驱动和模型。详细日志：{log_path}"
                 )
             try:
                 self._request("/health", None, timeout=2)
@@ -630,6 +646,50 @@ def _legacy_generate_voice_pack(
     return manifest_path
 
 
+def _resume_fingerprint(lines: list[dict], engine: str, voice: str, speed: float,
+                        options: dict, instructions: dict) -> str:
+    relevant = dict(options) if is_qwen_engine(engine) else {}
+    relevant.pop("backend", None)
+    reference = relevant.pop("reference_audio", "")
+    if reference and is_qwen_engine(engine):
+        reference_path = restore_path(reference)
+        if reference_path.is_file():
+            with reference_path.open("rb") as stream:
+                relevant["reference_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        else:
+            relevant["reference_sha256"] = str(reference)
+    payload = {"lines": [(line.get("line_id"), line["text"], instructions.get(str(line.get("line_id", ""))) or line.get("tts_instruct") or relevant.get("instruct", "")) for line in lines],
+               "engine": normalize_qwen_engine(engine), "voice": voice,
+               "speed": round(float(speed), 1), "options": relevant}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _compatible_legacy_manifest(payload: dict, lines: list[dict], engine: str,
+                                voice: str, speed: float, options: dict, instructions: dict) -> bool:
+    if not payload or normalize_qwen_engine(str(payload.get("engine"))) != normalize_qwen_engine(engine):
+        return False
+    if payload.get("voice") != voice or payload.get("speed") != round(float(speed), 1):
+        return False
+    old_lines = payload.get("lines") or []
+    if len(old_lines) != len(lines) or any(old.get("text") != line["text"] for old, line in zip(old_lines, lines)):
+        return False
+    if is_qwen_engine(engine):
+        old_options = payload.get("qwen") or {}
+        for key in ("mode", "reference_text", "instruct"):
+            default = QWEN_MODE_CUSTOM if key == "mode" else ""
+            if str(old_options.get(key, default)) != str(options.get(key, default)):
+                return False
+        if options.get("mode") == QWEN_MODE_CLONE:
+            # An old record has no reference-audio hash, so do not guess that
+            # an overwritten reference still contains the same voice.
+            return False
+        for old, line in zip(old_lines, lines):
+            expected = instructions.get(str(line.get("line_id", ""))) or line.get("tts_instruct") or options.get("instruct", "")
+            if old.get("status", "completed") == "completed" and old.get("tts_instruct", "") != expected:
+                return False
+    return True
+
+
 def generate_voice_pack(
     story_path: Path,
     output_root: Path,
@@ -642,6 +702,9 @@ def generate_voice_pack(
     paused: threading.Event | None = None,
     qwen_options: dict[str, str] | None = None,
     line_instructions: dict[str, str] | None = None,
+    state_changed: Callable[[Path, dict], None] | None = None,
+    generation_config: dict | None = None,
+    resume_manifest: Path | None = None,
 ) -> Path:
     """Generate a pack while persisting per-line status for resume and retry."""
     segment, lines = _load_generation_source(story_path)
@@ -657,22 +720,41 @@ def generate_voice_pack(
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(qwen_mode) / _safe_part(voice)
     else:
         pack_dir = output_root / event_id / story_id / _safe_part(engine) / _safe_part(voice)
+    fingerprint = _resume_fingerprint(lines, engine, voice, speed, qwen_options, line_instructions)
+    def read_manifest(path: Path) -> dict:
+        try:
+            return read_json_object(path)
+        except (OSError, ValueError):
+            return {}
+    def compatible(payload: dict) -> bool:
+        return payload.get("generation_fingerprint") == fingerprint or (
+            not payload.get("generation_fingerprint") and
+            _compatible_legacy_manifest(payload, lines, engine, voice, speed, qwen_options, line_instructions))
+    previous = read_manifest(pack_dir / "manifest.json")
+    if resume_manifest is not None:
+        candidate = restore_path(resume_manifest).resolve()
+        if candidate.is_relative_to(output_root.resolve()):
+            resumed = read_manifest(candidate)
+            if compatible(resumed):
+                pack_dir, previous = candidate.parent, resumed
+    if not compatible(previous):
+        # A different text/speed/voice reference must never overwrite old audio.
+        pack_dir = pack_dir / f"v_{fingerprint[:16]}"
+        previous = read_manifest(pack_dir / "manifest.json")
+        if not compatible(previous):
+            previous = {}
     pack_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = pack_dir / "manifest.json"
     extension = "mp3" if engine == ENGINE_EDGE else "wav"
     total = len(lines)
     entries: list[dict] = []
+    previous_lines = previous.get("lines") or []
     for index, line in enumerate(lines, start=1):
         expected = pack_dir / f"{index:04d}.{extension}"
-        if not expected.exists() or expected.stat().st_size == 0:
-            expected = next(
-                (
-                    candidate for candidate in sorted(pack_dir.glob(f"{index:04d}.*"))
-                    if candidate.is_file() and candidate.stat().st_size > 0
-                ),
-                expected,
-            )
-        complete = expected.exists() and expected.is_file() and expected.stat().st_size > 0
+        old = previous_lines[index - 1] if index <= len(previous_lines) else {}
+        if old.get("audio"):
+            expected = pack_dir / Path(str(old["audio"])).name
+        complete = old.get("status", "completed") in {"completed", "generating"} and bool(old) and expected.is_file() and expected.stat().st_size > 0
         text = str(line["text"])
         entries.append(
             {
@@ -684,12 +766,14 @@ def generate_voice_pack(
                 "audio": expected.name if complete else "",
                 "status": "completed" if complete else "pending",
                 "error": "",
-                "tts_instruct": "",
+                "tts_instruct": old.get("tts_instruct", "") if complete else "",
             }
         )
 
     manifest = {
         "format": "arknights-tts-voice-pack-v1",
+        "generation_fingerprint": fingerprint,
+        "generation_config": generation_config or {"engine": engine, "voice": voice, "speed": speed, "qwen_options": qwen_options, "optimize_quality": bool(line_instructions)},
         "status": "generating",
         "engine": engine,
         "voice": voice,
@@ -702,15 +786,15 @@ def generate_voice_pack(
             "reference_text": str(qwen_options.get("reference_text", "")),
             "instruct": str(qwen_options.get("instruct", "")),
         } if is_qwen_engine(engine) else None,
-        "source_story": str(story_path),
+        "source_story": portable_path(story_path),
         "segment": segment,
         "lines": entries,
     }
 
     def save_state() -> None:
-        temporary = manifest_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(manifest_path)
+        atomic_json_save(manifest_path, manifest)
+        if state_changed is not None:
+            state_changed(manifest_path, manifest)
 
     def mark_interrupted() -> None:
         for entry in entries:
@@ -726,7 +810,7 @@ def generate_voice_pack(
             if cancelled.is_set():
                 mark_interrupted()
                 raise GenerationInterrupted(manifest_path)
-            progress(index - 1, total, f"paused, waiting to continue: {index}/{total}")
+            progress(index - 1, total, f"已暂停，下一句 {index}/{total}")
             time.sleep(0.2)
         if cancelled.is_set():
             mark_interrupted()
@@ -734,7 +818,7 @@ def generate_voice_pack(
 
         entry = entries[index - 1]
         if entry.get("status") == "completed" and entry.get("audio"):
-            progress(index, total, f"already exists: {index}/{total}")
+            progress(index, total, f"复用已完成音频：{index}/{total}")
             continue
         entry["status"] = "generating"
         entry["error"] = ""
@@ -749,11 +833,18 @@ def generate_voice_pack(
         )
         output = pack_dir / f"{index:04d}.{extension}"
         try:
-            progress(index - 1, total, f"generating {index}/{total}: {text[:24]}")
+            progress(index - 1, total, f"正在生成第 {index}/{total} 句：{text[:60]}")
             audio, actual_extension = backend.synthesize(engine, text, voice, speed, line_options)
             if actual_extension != extension:
                 output = output.with_suffix(f".{actual_extension}")
-            output.write_bytes(audio)
+            if not audio:
+                raise RuntimeError("语音服务返回了空音频")
+            temporary_audio = output.with_suffix(output.suffix + ".tmp")
+            with temporary_audio.open("wb") as stream:
+                stream.write(audio)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary_audio.replace(output)
         except Exception as exc:
             if cancelled.is_set():
                 mark_interrupted()
@@ -762,13 +853,13 @@ def generate_voice_pack(
             entry["error"] = str(exc)[:1000]
             entry["tts_instruct"] = line_options.get("instruct", "") if is_qwen_engine(engine) else ""
             save_state()
-            progress(index, total, f"failed {index}/{total}: {text[:24]}")
+            progress(index, total, f"第 {index}/{total} 句失败：{text[:24]}")
             continue
         entry["status"] = "completed"
         entry["audio"] = output.name
         entry["tts_instruct"] = line_options.get("instruct", "") if is_qwen_engine(engine) else ""
         save_state()
-        progress(index, total, f"completed {index}/{total}")
+        progress(index, total, f"已完成第 {index}/{total} 句")
 
     failed_entries = [entry for entry in entries if entry.get("status") == "failed"]
     if failed_entries:

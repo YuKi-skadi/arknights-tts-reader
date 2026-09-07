@@ -6,9 +6,12 @@ import argparse
 import ctypes
 import os
 import sys
+import threading
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, Signal, QTimer, QLockFile
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,6 +48,7 @@ class RegionOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
         self.setWindowState(Qt.WindowState.WindowFullScreen)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowOpacity(0.28)
         self.setStyleSheet("background:#102030;")
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -59,6 +63,8 @@ class RegionOverlay(QWidget):
         painter.setPen(QPen(QColor("#ffffff"), 1))
         painter.setFont(QFont("Microsoft YaHei UI", 14, QFont.Weight.Bold))
         painter.drawText(24, 34, "拖拽框选台词区域 · Esc 取消")
+        if self.rubber is not None:
+            painter.drawRect(self.rubber)
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -93,10 +99,19 @@ class RegionOverlay(QWidget):
 class ReaderApp(QMainWindow):
     """Modern Qt shell while keeping existing backend/data contracts."""
 
+    listener_event = Signal(int, str, str, object)
+
     def __init__(self) -> None:
         configure_windows_dpi()
         super().__init__()
+        self._listener_session = 0
+        self.listener_event.connect(self._dispatch_listener_event)
+        self._closing = False
+        self._close_ready = False
+        self._cleanup_thread = None
         self.setWindowTitle(APP_TITLE)
+        # Keep the functional sidebar usable at the smallest allowed window;
+        # the decorative image is the first area allowed to disappear.
         self.setMinimumSize(900, 600)
         self.resize(1180, 760)
         icon = project_dir() / "assets" / "app_icon.ico"
@@ -192,8 +207,8 @@ class ReaderApp(QMainWindow):
         side.setMinimumWidth(170)
         side.setMaximumWidth(230)
         side_layout = QVBoxLayout(side)
-        side_layout.setContentsMargins(14, 18, 14, 14)
-        side_layout.setSpacing(5)
+        side_layout.setContentsMargins(14, 14, 14, 8)
+        side_layout.setSpacing(4)
         side_title = QLabel("功能模块")
         side_title.setObjectName("sideTitle")
         side_hint = QLabel("选择模块后，在右侧工作区操作")
@@ -208,12 +223,50 @@ class ReaderApp(QMainWindow):
             button.setCheckable(True)
             button.setAutoExclusive(True)
             button.setObjectName("navButton")
+            button.setMinimumWidth(0)
+            button.setMinimumHeight(30)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda checked=False, module_key=key: self.show_module(module_key))
             self.nav_buttons[key] = button
             side_layout.addWidget(button)
-        side_layout.addSpacing(18)
-        side_layout.addWidget(self._build_reading_control())
-        side_layout.addStretch(1)
+        side_layout.addSpacing(8)
+
+        # Reserve a real bottom region for the decoration and the functional
+        # card. The image has its own bounded area; it can collapse when the
+        # sidebar is short, but it can never resize over the reading controls.
+        bottom_region = QWidget()
+        bottom_region.setObjectName("sidebarBottomRegion")
+        bottom_region.setMinimumHeight(0)
+        bottom_layout = QVBoxLayout(bottom_region)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(4)
+        decoration_area = QWidget()
+        decoration_area.setObjectName("sidebarDecorationArea")
+        decoration_area.setMinimumHeight(0)
+        decoration_area.setMaximumHeight(220)
+        # Ignore the image's size hint so this region can collapse completely
+        # when the sidebar is short; the reading card remains measurable.
+        decoration_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        decoration_layout = QHBoxLayout(decoration_area)
+        decoration_layout.setContentsMargins(0, 0, 0, 0)
+        decoration_layout.setSpacing(0)
+        self.sidebar_image = QLabel()
+        self.sidebar_image.setObjectName("sidebarDecoration")
+        self.sidebar_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_image.setMinimumSize(0, 0)
+        self.sidebar_image.setMaximumWidth(200)
+        self.sidebar_image.setMaximumHeight(220)
+        self.sidebar_image.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.sidebar_image.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        decoration_layout.addWidget(self.sidebar_image, 1)
+        bottom_layout.addWidget(decoration_area, 1)
+
+        reading_control = self._build_reading_control()
+        reading_control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        reading_control.setMinimumHeight(reading_control.sizeHint().height())
+        bottom_layout.addWidget(reading_control, 0)
+        side_layout.addWidget(bottom_region, 1)
+        self.refresh_customization()
         splitter.addWidget(side)
 
         work = QWidget()
@@ -235,6 +288,9 @@ class ReaderApp(QMainWindow):
         frame.setObjectName("uiCard")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        frame.setMinimumWidth(0)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         title = QLabel("朗读控制")
         title.setObjectName("cardTitle")
         layout.addWidget(title)
@@ -242,9 +298,14 @@ class ReaderApp(QMainWindow):
         select.clicked.connect(self.select_region)
         layout.addWidget(select)
         row = QHBoxLayout()
+        row.setSpacing(4)
         self.start_button = QPushButton("开始监听")
+        self.start_button.setMinimumWidth(0)
+        self.start_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.start_button.clicked.connect(self.start_listening)
         self.stop_button = QPushButton("停止监听")
+        self.stop_button.setMinimumWidth(0)
+        self.stop_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_listening)
         row.addWidget(self.start_button)
@@ -259,6 +320,11 @@ class ReaderApp(QMainWindow):
         self.speed_slider = QSlider(Qt.Orientation.Horizontal)
         self.speed_slider.setRange(1, 20)
         self.speed_slider.setValue(10)
+        self.speed_slider.setEnabled(False)
+        self.speed_slider.setMinimumWidth(0)
+        self.speed_slider.setFixedHeight(14)
+        self.speed_slider.setToolTip("播放使用音频原速；需要调整语速时请在语音生成中设置后重新生成。")
+        self.speed_value.setText("原速")
         self.speed_slider.valueChanged.connect(self._speed_changed)
         layout.addWidget(self.speed_slider)
         self.listener_status = QLabel("状态：未监听")
@@ -279,6 +345,7 @@ class ReaderApp(QMainWindow):
             panel.module_key = key
             self.panel_instances[key] = panel
             self.stack.addWidget(panel)
+        panel.refresh_customization()
         self.stack.setCurrentWidget(panel)
         self.module_title.setText(f"当前模块：{self.modules[key][0]}")
         self.nav_buttons[key].setChecked(True)
@@ -291,9 +358,13 @@ class ReaderApp(QMainWindow):
         self.ocr_interval = max(0.1, min(5.0, round(float(value), 1)))
         self.settings["ocr_interval"] = self.ocr_interval
         save_app_settings(self.settings)
+        if self.listener_engine is not None:
+            self.listener_engine.interval = self.ocr_interval
         self.set_status(f"OCR 轮询间隔已保存：{self.ocr_interval:.1f} 秒")
 
     def set_voice_pack(self, path: Path | None, manifest: dict | None) -> None:
+        if self.listening and path != self.selected_voice_pack:
+            self.stop_listening()
         self.selected_voice_pack = path
         self.selected_voice_manifest = manifest
         panel = self.panel_instances.get("reader")
@@ -322,7 +393,11 @@ class ReaderApp(QMainWindow):
             panel.update_region(self.region)
 
     def _listener_event(self, kind: str, text: str, data: dict | None = None) -> None:
-        self._listener_event_ui(kind, text, data)
+        self.listener_event.emit(self._listener_session, kind, text, data)
+
+    def _dispatch_listener_event(self, session: int, kind: str, text: str, data: object) -> None:
+        if session == self._listener_session and not self._closing:
+            self._listener_event_ui(kind, text, data)
 
     def _listener_event_ui(self, kind: str, text: str, data: dict | None = None) -> None:
         panel = self.panel_instances.get("reader")
@@ -345,12 +420,16 @@ class ReaderApp(QMainWindow):
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.listener_status.setText("状态：监听错误")
+            if isinstance(panel, ReaderPanel):
+                panel.update_listening(False)
             self.set_status(f"OCR 监听失败：{text}")
             QMessageBox.critical(self, "OCR 监听失败", text)
         elif kind == "stopped" and not self.listening:
             self.set_status(text)
 
     def start_listening(self) -> None:
+        if self.listening or self._closing:
+            return
         if self.selected_voice_pack is None or not self.selected_voice_pack.exists():
             QMessageBox.warning(self, "未选择语音包", "请先在“朗读监听”模块中选择当前语音包。")
             return
@@ -358,7 +437,9 @@ class ReaderApp(QMainWindow):
             self.set_status("请先点击“选择台词区域”完成框选")
             return
         try:
-            self.listener_engine = ListenerEngine(self.region, self.selected_voice_pack, self._listener_event, self.ocr_interval)
+            self._listener_session += 1
+            session = self._listener_session
+            self.listener_engine = ListenerEngine(self.region, self.selected_voice_pack, lambda kind, text, data: self.listener_event.emit(session, kind, text, data), self.ocr_interval)
             self.listener_engine.start()
         except Exception as exc:
             QMessageBox.critical(self, "OCR 启动失败", str(exc))
@@ -370,9 +451,10 @@ class ReaderApp(QMainWindow):
         panel = self.panel_instances.get("reader")
         if isinstance(panel, ReaderPanel):
             panel.update_listening(True)
-        self.set_status("朗读监听已启动（OCR匹配功能接入中）")
+        self.set_status("朗读监听已启动")
 
     def stop_listening(self) -> None:
+        self._listener_session += 1
         if self.listener_engine is not None:
             self.listener_engine.stop()
             self.listener_engine = None
@@ -448,13 +530,15 @@ class ReaderApp(QMainWindow):
             save_app_settings(self.settings)
 
     def custom_image_path(self, slot: str) -> Path | None:
-        configured = str(self.settings.get(f"custom_{slot}_image", "")).strip()
-        if not configured:
-            return None
-        path = Path(configured)
-        if not path.is_absolute():
-            path = project_dir() / path
-        return path if path.is_file() else None
+        return self._resolve_configured_custom_path(f"custom_{slot}_image")
+
+    def refresh_customization(self) -> None:
+        path = self.custom_image_path("sidebar")
+        pixmap = QPixmap(str(path)) if path else QPixmap()
+        self.sidebar_image.setPixmap(pixmap.scaled(180, 198, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation) if not pixmap.isNull() else pixmap)
+        self.sidebar_image.setVisible(not pixmap.isNull())
+        for panel in self.panel_instances.values():
+            panel.refresh_customization()
 
     def custom_image_name(self, slot: str) -> str:
         path = self.custom_image_path(slot)
@@ -468,6 +552,7 @@ class ReaderApp(QMainWindow):
             destination = self._normalize_custom_image(slot, source)
             self.settings[f"custom_{slot}_image"] = str(destination.relative_to(project_dir())).replace("\\", "/")
             save_app_settings(self.settings)
+            self.refresh_customization()
             self.set_status(f"已设置{CUSTOMIZATION_SLOTS[slot][0]}：{destination.name}")
             return True
         except Exception as exc:
@@ -483,31 +568,77 @@ class ReaderApp(QMainWindow):
                 pass
         self.settings.pop(f"custom_{slot}_image", None)
         save_app_settings(self.settings)
+        self.refresh_customization()
         self.set_status(f"已清除{CUSTOMIZATION_SLOTS.get(slot, ('自定义图片', (0, 0)))[0]}")
 
     def closeEvent(self, event) -> None:
-        if self.listener_engine is not None:
-            self.listener_engine.stop()
+        if self._close_ready:
+            event.accept()
+            return
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_listening()
+        if self.region_overlay is not None:
+            self.region_overlay.close()
+        self.centralWidget().setEnabled(False)
         for panel in self.panel_instances.values():
-            save = getattr(panel, "save_queue_state", None)
-            if callable(save):
-                save()
-            release = getattr(getattr(panel, "backend", None), "release_qwen", None)
-            if callable(release):
-                release()
-        event.accept()
+            shutdown = getattr(panel, "request_shutdown", None)
+            if callable(shutdown):
+                shutdown()
+        self.set_status("正在保存断点并退出；当前语音或分析请求完成后关闭，下次可继续队列…")
+        self._poll_shutdown()
+
+    def _poll_shutdown(self) -> None:
+        workers = [getattr(panel, "queue_thread", None) for panel in self.panel_instances.values()]
+        if any(worker and worker.is_alive() for worker in workers):
+            QTimer.singleShot(100, self._poll_shutdown)
+            return
+        if self._cleanup_thread is None:
+            def cleanup() -> None:
+                for panel in self.panel_instances.values():
+                    release = getattr(getattr(panel, "backend", None), "release_qwen", None)
+                    if callable(release):
+                        try:
+                            release()
+                        except Exception:
+                            logging.exception("Backend shutdown failed")
+            self._cleanup_thread = threading.Thread(target=cleanup, daemon=True)
+            self._cleanup_thread.start()
+        if self._cleanup_thread.is_alive():
+            QTimer.singleShot(100, self._poll_shutdown)
+            return
+        self._close_ready = True
+        self.close()
 
 
 def run() -> int:
     parser = argparse.ArgumentParser(description=APP_TITLE)
     parser.add_argument("--check", action="store_true", help="检查 Qt GUI 模块是否可以导入")
+    parser.add_argument("--self-test-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--self-test-phase", choices=("prepare", "resume"), default="prepare", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.self_test_output:
+        from diagnostics import run_smoke
+        return run_smoke(args.self_test_output, args.self_test_phase)
     if args.check:
         print(f"{APP_TITLE}: Qt GUI shell import OK")
         print("modules: story_download, voice_generation, voice_packs, reader, settings")
         return 0
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
+    log_dir = project_dir() / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(log_dir.parent / "app.lock"))
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None, APP_TITLE, "这个目录中的程序已经打开，请使用现有窗口。")
+        return 0
+    logging.basicConfig(level=logging.INFO, handlers=[RotatingFileHandler(log_dir / "app.log", maxBytes=2_000_000, backupCount=2, encoding="utf-8")])
+    def report_error(exc_type, value, traceback) -> None:
+        logging.error("Unhandled exception", exc_info=(exc_type, value, traceback))
+        QMessageBox.critical(None, "操作失败", f"{value}\n\n详细信息已记录到 data/logs/app.log。")
+    sys.excepthook = report_error
     window = ReaderApp()
     window.show()
     return app.exec()
