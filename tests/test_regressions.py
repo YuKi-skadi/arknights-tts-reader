@@ -315,6 +315,45 @@ class Regressions(unittest.TestCase):
         self.assertEqual(panel.queue_items[1]["status"], "待处理")
         self.assertEqual(len(panel.backend.calls), 1)
 
+    def test_auto_shutdown_after_queue_drains_even_with_partial_task(self):
+        window = self.window()
+        window.show_module("voice_generation")
+        panel = window.panel_instances["voice_generation"]
+        panel.shutdown_on_complete.setChecked(True)
+        panel.queue_items = [
+            {"path": self.story, "status": "已完成", "done": 3, "total": 3, "generation_config": dict(self.config)},
+            {"path": self.story, "status": "已完成", "done": 3, "total": 3, "generation_config": dict(self.config)},
+        ]
+        completed = subprocess.CompletedProcess(["shutdown.exe"], 0, "", "")
+        with patch.object(qt_voice.sys, "platform", "win32"), patch.object(qt_voice.subprocess, "run", return_value=completed) as run:
+            panel._queue_finished()
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], ["shutdown.exe", "/s", "/t", str(qt_voice.AUTO_SHUTDOWN_DELAY_SECONDS)])
+
+        window = self.window()
+        window.show_module("voice_generation")
+        panel = window.panel_instances["voice_generation"]
+        panel.shutdown_on_complete.setChecked(True)
+        panel.queue_items = [
+            {"path": self.story, "status": "部分完成", "done": 2, "total": 3, "generation_config": dict(self.config)},
+        ]
+        with patch.object(qt_voice.sys, "platform", "win32"), patch.object(qt_voice.subprocess, "run", return_value=completed) as run:
+            panel._queue_finished()
+        run.assert_called_once()
+
+        window = self.window()
+        window.show_module("voice_generation")
+        panel = window.panel_instances["voice_generation"]
+        panel.shutdown_on_complete.setChecked(True)
+        panel.pause_event.set()
+        panel.queue_items = [
+            {"path": self.story, "status": "已暂停", "done": 2, "total": 3, "generation_config": dict(self.config)},
+        ]
+        with patch.object(qt_voice.sys, "platform", "win32"), patch.object(qt_voice.subprocess, "run") as run:
+            panel._queue_finished()
+        run.assert_not_called()
+
     def test_region_overlay_can_be_reopened(self):
         window = self.window()
         window.select_region()

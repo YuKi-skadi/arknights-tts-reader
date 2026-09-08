@@ -7,6 +7,8 @@ import shutil
 import threading
 import hashlib
 import logging
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -60,6 +62,9 @@ from voice_generation import (
 from voice_queue import VoiceQueueStore, manifest_progress, restore_path
 
 
+AUTO_SHUTDOWN_DELAY_SECONDS = 60
+
+
 class VoiceSignals(QObject):
     status = Signal(str)
     progress = Signal(int, int, str)
@@ -87,6 +92,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.current_queue_index: int | None = None
         self.user_stopped = False
         self.shutting_down = False
+        self.auto_shutdown_sent = False
         self.queue_save_error = ""
         self.queue_config: dict[str, object] = {
             "engine": ENGINE_EDGE,
@@ -94,6 +100,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
             "speed": 1.0,
             "qwen_options": {},
             "optimize_quality": False,
+            "shutdown_on_complete": False,
         }
         self.queue_config.update(saved_queue_config)
         super().__init__(app, "语音生成", "选择剧情或自定义文本，锁定引擎、模型和显卡后逐句生成语音包。")
@@ -227,6 +234,10 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         queue_head.addWidget(QLabel("任务筛选"))
         queue_head.addWidget(self.queue_filter)
         queue_head.addStretch(1)
+        self.shutdown_on_complete = QCheckBox("队列跑完后自动关机")
+        self.shutdown_on_complete.setToolTip("本轮队列中的每个任务都尝试过后提交 Windows 关机；部分完成或失败也会继续后续任务并触发。暂停、停止或关闭软件不会触发。提交后延迟 60 秒，可用 shutdown /a 取消。")
+        self.shutdown_on_complete.toggled.connect(self._on_shutdown_setting_changed)
+        queue_head.addWidget(self.shutdown_on_complete)
         recover = QPushButton("恢复历史任务")
         recover.clicked.connect(self.recover_history)
         queue_head.addWidget(recover)
@@ -497,6 +508,12 @@ class ConnectedVoiceGenerationPanel(BasePanel):
 
     def _apply_saved_queue_config(self) -> None:
         self._apply_generation_config(self.queue_config)
+        self.shutdown_on_complete.setChecked(bool(self.queue_config.get("shutdown_on_complete", False)))
+
+    def _on_shutdown_setting_changed(self, checked: bool) -> None:
+        self.queue_config["shutdown_on_complete"] = bool(checked)
+        if hasattr(self, "queue_store"):
+            self._save_queue_state()
 
     def _generation_config_label(self, config: dict[str, object]) -> str:
         engine = normalize_qwen_engine(str(config.get("engine", ENGINE_EDGE)))
@@ -639,6 +656,8 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         self.cancelled.clear()
         self.pause_event.clear()
         self.user_stopped = False
+        self.auto_shutdown_sent = False
+        self.queue_config["shutdown_on_complete"] = self.shutdown_on_complete.isChecked()
         self.queue_start_button.setEnabled(False)
         self.queue_pause_button.setEnabled(True)
         self.queue_stop_button.setEnabled(True)
@@ -752,6 +771,7 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         if self.queue_save_error:
             self.warning("队列保存失败", self.queue_save_error)
         successful = bool(self.queue_items) and all(item.get("status") == "已完成" for item in self.queue_items)
+        queue_drained = bool(self.queue_items) and not self.shutting_down and not self.user_stopped and not self.cancelled.is_set() and not self.pause_event.is_set()
         if successful:
             self.progress.setValue(100)
             self.progress_text.setText("全部语音生成完成")
@@ -759,6 +779,38 @@ class ConnectedVoiceGenerationPanel(BasePanel):
         else:
             self.progress_text.setText("本轮队列已结束，请检查部分完成或中断任务")
             self.set_status("本轮语音生成队列已结束，请检查部分完成或中断任务")
+        if self.shutdown_on_complete.isChecked() and queue_drained and not self.auto_shutdown_sent:
+            self.auto_shutdown_sent = True
+            self._request_system_shutdown()
+
+    def _request_system_shutdown(self) -> None:
+        if sys.platform != "win32":
+            self.set_status("全部语音生成完成；自动关机仅支持 Windows")
+            return
+        try:
+            result = subprocess.run(
+                [
+                    "shutdown.exe",
+                    "/s",
+                    "/t",
+                    str(AUTO_SHUTDOWN_DELAY_SECONDS),
+                    "/c",
+                    "语音生成队列本轮已结束",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            logging.exception("Automatic system shutdown failed")
+            self.set_status(f"语音已全部生成，但提交自动关机失败：{exc}")
+            return
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "未知错误").strip()
+            self.set_status(f"语音已全部生成，但提交自动关机失败：{detail}")
+            return
+        self.set_status(f"全部语音生成完成，系统将在 {AUTO_SHUTDOWN_DELAY_SECONDS} 秒后关机；如需取消请运行 shutdown /a")
 
     def _generation_progress(self, done: int, total: int, text: str) -> None:
         self.signals.progress.emit(done, total, text)
